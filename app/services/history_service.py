@@ -19,8 +19,8 @@ HISTORY_TTL = timedelta(hours=24)
 MAX_HISTORY_MESSAGES = 20
 
 
-def _key(platform_id: str, user_id: str) -> str:
-    return f"chat:history:{platform_id}:{user_id}"
+def _key(platform_id: str, user_id: str, session_id: str) -> str:
+    return f"chat:history:{platform_id}:{user_id}:{session_id}"
 
 
 async def _get_redis() -> aioredis.Redis:
@@ -29,12 +29,15 @@ async def _get_redis() -> aioredis.Redis:
 
 # ─── Redis (sesión activa) ────────────────────────────────────────────────────
 
-async def load_history(platform_id: str, user_id: str) -> list[dict]:
-    """Carga el historial reciente desde Redis."""
+async def load_history(platform_id: str, user_id: str, session_id: str) -> list[dict]:
+    """Carga el historial reciente desde Redis para una sesión específica."""
     r = await _get_redis()
     try:
-        raw = await r.get(_key(platform_id, user_id))
-        return json.loads(raw) if raw else []
+        raw = await r.get(_key(platform_id, user_id, session_id))
+        if raw:
+            return json.loads(raw)
+        # Fallback: cargar desde MongoDB si no está en Redis (sesión reanudada)
+        return await _load_session_from_mongo(platform_id, user_id, session_id)
     except Exception as e:
         print(f"[history] redis load error: {e}")
         return []
@@ -42,13 +45,35 @@ async def load_history(platform_id: str, user_id: str) -> list[dict]:
         await r.aclose()
 
 
-async def save_history(platform_id: str, user_id: str, history: list[dict]) -> None:
-    """Guarda el historial en Redis."""
+async def _load_session_from_mongo(
+    platform_id: str, user_id: str, session_id: str
+) -> list[dict]:
+    """Reconstruye el historial de una sesión desde MongoDB (para reanudar)."""
+    from app.models.conversation import ChatTurn
+    try:
+        turns = await ChatTurn.find(
+            ChatTurn.platform_id == platform_id,
+            ChatTurn.user_id == user_id,
+            ChatTurn.session_id == session_id,
+        ).sort(ChatTurn.created_at).to_list()
+
+        history = []
+        for t in turns:
+            history.append({"role": "user", "content": t.user_message})
+            history.append({"role": "assistant", "content": t.assistant_message})
+        return history
+    except Exception as e:
+        print(f"[history] mongo session load error: {e}")
+        return []
+
+
+async def save_history(platform_id: str, user_id: str, session_id: str, history: list[dict]) -> None:
+    """Guarda el historial en Redis para una sesión específica."""
     r = await _get_redis()
     try:
         trimmed = history[-MAX_HISTORY_MESSAGES:]
         await r.set(
-            _key(platform_id, user_id),
+            _key(platform_id, user_id, session_id),
             json.dumps(trimmed, ensure_ascii=False),
             ex=int(HISTORY_TTL.total_seconds()),
         )
@@ -58,11 +83,16 @@ async def save_history(platform_id: str, user_id: str, history: list[dict]) -> N
         await r.aclose()
 
 
-async def clear_history(platform_id: str, user_id: str) -> None:
-    """Borra el historial de Redis."""
+async def clear_history(platform_id: str, user_id: str, session_id: str | None = None) -> None:
+    """Borra el historial de Redis. Si no se pasa session_id, borra todas las sesiones del usuario."""
     r = await _get_redis()
     try:
-        await r.delete(_key(platform_id, user_id))
+        if session_id:
+            await r.delete(_key(platform_id, user_id, session_id))
+        else:
+            keys = await r.keys(f"chat:history:{platform_id}:{user_id}:*")
+            if keys:
+                await r.delete(*keys)
     finally:
         await r.aclose()
 

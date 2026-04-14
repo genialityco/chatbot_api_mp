@@ -6,6 +6,7 @@ Para Gemini usa el SDK nativo (google-genai) para evitar problemas de serializac
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from typing import Any
 
@@ -16,7 +17,7 @@ from langchain_anthropic import ChatAnthropic
 
 from app.core.config import get_settings
 from app.rag.pipeline import RAGRetriever
-from app.db.mongo_query import fetch_collection_data, docs_to_context, generate_filter_async
+from app.db.mongo_query import fetch_collection_data, docs_to_context, generate_filter_async, search_transcript_segments
 from app.db.schema_introspector import load_schema_cache
 from app.services.history_service import load_history, save_history, persist_turn
 
@@ -128,9 +129,28 @@ SYSTEM_TEMPLATE = """{system_prompt}
 - Si el usuario pregunta por recomendaciones, usa los cursos/eventos disponibles para sugerir.
 - Responde en el mismo idioma que el usuario.
 - NO digas que no tienes información si los datos están presentes arriba.
+- Nunca muestres IDs de MongoDB en la respuesta fuera de una URL.
+- Cuando muestres un curso de `events`, el ID para la URL es el campo `_id` del evento (NO el userId).
+- Cuando muestres un curso de `courseattendees`, el ID para la URL es el campo `event_id`.
+- Cuando muestres una actividad, el ID para la URL es el `_id` de la actividad.
+- Formato de URLs de GenCampus:
+  - Perfil/cursos del usuario: {base_url}/organization/{{org_id}}/profile?tab=courses
+  - Curso: {base_url}/organization/{{org_id}}/course/{{_id_del_evento}}
+  - Actividad/video: {base_url}/organization/{{org_id}}/activitydetail/{{_id_actividad}}
+
+## Corrección ortográfica
+- Si el usuario escribe con faltas de ortografía, errores de tildes o términos médicos/educativos mal escritos, CORRÍGELOS AUTOMÁTICAMENTE en tu respuesta.
+- Ejemplos comunes: "cancer" → "cáncer", "mama" → "mamá", "informacion" → "información", "evaluacion" → "evaluación", "hipertension" → "hipertensión", "sintomas" → "síntomas".
+- Mantén la corrección natural y no menciones que estás corrigiendo errores.
 """
 
 NO_CONTEXT_TEMPLATE = """{system_prompt}
+
+## Corrección ortográfica
+- Si el usuario escribe con faltas de ortografía, errores de tildes o términos médicos/educativos mal escritos, CORRÍGELOS AUTOMÁTICAMENTE en tu respuesta.
+- Ejemplos comunes: "cancer" → "cáncer", "mama" → "mamá", "informacion" → "información", "evaluacion" → "evaluación", "hipertension" → "hipertensión", "sintomas" → "síntomas".
+- Mantén la corrección natural y no menciones que estás corrigiendo errores.
+
 
 No se encontró información relevante en la base de datos para esta consulta.
 Responde indicando que no tienes datos disponibles sobre este tema.
@@ -156,6 +176,7 @@ def build_prompt(
             user_id=user_id,
             user_name=user_name or "desconocido",
             org_id=org_id or "N/A",
+            base_url=settings.gencampus_base_url,
         )
     else:
         system_content = NO_CONTEXT_TEMPLATE.format(system_prompt=system_prompt)
@@ -231,8 +252,7 @@ class ChatService:
             ctx_parts = [f"{user_id_field}: {user_id}"]
             if user_name:
                 ctx_parts.append(f"nombre: {user_name}")
-            if org_id:
-                ctx_parts.append(f"org_id: {org_id}")
+            # NOTA: no incluir org_id en el enriquecimiento — se usa solo para URLs, no para filtros MongoDB
             enriched_message = f"{message} [{', '.join(ctx_parts)}]"
         else:
             # Consulta general — sin contexto de usuario
@@ -241,7 +261,7 @@ class ChatService:
         # ── Paso 1: RAG + historial en paralelo ──────────────────────────────
         (schema_context, sources), history = await asyncio.gather(
             asyncio.to_thread(self._rag_retrieve, message),
-            load_history(self.platform_id, user_id),
+            load_history(self.platform_id, user_id, session_id),
         )
 
         # ── Paso 2: generar filtro + cargar schema cache en paralelo ─────────
@@ -250,43 +270,102 @@ class ChatService:
             conn = self.db_connections[0]
             primary = sources[0].get("collection", "")
 
+            # Detectar si la pregunta es sobre actividades
+            _activity_kw = ["actividad", "actividades", "clase", "clases", "lección", "lecciones", "curso", "cursos"]
+            is_activity_question = any(kw in message.lower() for kw in _activity_kw)
+
+            # Forzar transcript_segments si la pregunta es sobre videos
+            _video_kw = ["video", "videos", "grabación", "grabacion",
+                         "transcripción", "transcripcion", "conferencia", "conferencias"]
+            if any(kw in message.lower() for kw in _video_kw):
+                primary = "transcript_segments"
+            elif is_activity_question and primary == "activities":
+                # Si pregunta por actividades y RAG detectó activities, buscar también en transcripts
+                pass  # Mantener primary como activities, pero agregar búsqueda en transcripts después
+
             if primary:
-                cached = load_schema_cache(conn["uri"], conn["database"], conn.get("collections"))
-                schema_fields = list(
-                    (cached or {}).get("collections", {})
-                    .get(primary, {}).get("schema", {}).keys()
-                )
+                collections_list = conn.get("collections")
+                print(f"[chat] loading cache with collections={collections_list}")
+                cached = load_schema_cache(conn["uri"], conn["database"], collections_list)
+                # Si no encuentra con collections específico, intentar con None (todas las colecciones)
+                if not cached and collections_list:
+                    print(f"[chat] cache miss with specific collections, retrying with None")
+                    cached = load_schema_cache(conn["uri"], conn["database"], None)
+                col_info = (cached or {}).get("collections", {}).get(primary, {})
+                print(f"[chat] cached_available={bool(cached)} primary={primary} col_info_keys={list(col_info.keys())}")
+                schema_fields = list(col_info.get("schema", {}).keys())
+                enum_values = col_info.get("enum_values", {})
 
-                # Generar filtro async (llama al LLM en paralelo con nada más por ahora)
-                mongo_filter = await generate_filter_async(enriched_message, primary, schema_fields)
-
-                # ── Paso 3: query MongoDB + enriquecimiento en paralelo ───────
-                docs = await asyncio.to_thread(
-                    _run_query, conn, primary, mongo_filter
-                )
+                # Generar filtro async solo si no es transcript_segments
+                if primary == "transcript_segments":
+                    docs = await _search_transcripts_async(conn, message)
+                else:
+                    mongo_filter = await generate_filter_async(enriched_message, primary, schema_fields, enum_values)
+                    print(f"[chat] schema_fields={schema_fields} mongo_filter_before={json.dumps(mongo_filter, default=str)}")
+                    # Expandir búsquedas de texto a palabras clave individuales
+                    mongo_filter = _expand_text_filter_to_keywords(mongo_filter, schema_fields)
+                    print(f"[chat] mongo_filter_after_keyword_expansion={json.dumps(mongo_filter, default=str)}")
+                    # Validar que el filtro solo use campos que existen en el schema (solo si tenemos schema)
+                    if schema_fields:
+                        mongo_filter = _validate_filter_fields(mongo_filter, set(schema_fields))
+                        print(f"[chat] mongo_filter_after_validation={json.dumps(mongo_filter, default=str)}")
+                    else:
+                        print(f"[chat] WARNING: no schema_fields available, skipping filter validation")
+                    if self.platform_id == "gencampus" and primary == "events":
+                        mongo_filter = _expand_events_text_filter_for_gencampus(mongo_filter)
+                    # Detectar si pide el último/más reciente → ordenar por fecha desc, limit 1
+                    _latest_kw = ["último", "ultimo", "más reciente", "mas reciente", "más nuevo", "mas nuevo", "latest", "newest"]
+                    is_latest = any(kw in message.lower() for kw in _latest_kw)
+                    date_fields = ["datetime_from", "datetime_to", "startDate", "start_date", "createdAt", "created_at", "date"]
+                    sort_field = next((f for f in date_fields if f in schema_fields), None)
+                    # Fallback: ordenar por _id desc (ObjectId tiene timestamp embebido)
+                    if is_latest and not sort_field:
+                        sort_field = "_id"
+                    sort = [(sort_field, -1)] if is_latest and sort_field else None
+                    limit = 1 if is_latest else None
+                    print(f"[chat] is_latest={is_latest} sort_field={sort_field} sort={sort} limit={limit}")
+                    docs = await asyncio.to_thread(_run_query, conn, primary, mongo_filter, sort, limit)
                 print(f"[chat] primary={primary} docs={len(docs)}")
 
                 if docs:
-                    data_parts.append(docs_to_context(primary, docs))
-                    related = await _fetch_related_async(docs, conn, cached, enriched_message)
-                    if related:
-                        data_parts.append(related)
+                    if primary == "transcript_segments":
+                        data_parts.append(_transcripts_to_context(docs))
+                    else:
+                        data_parts.append(docs_to_context(primary, docs, org_id or ""))
+                        related = await _fetch_related_async(docs, conn, cached, enriched_message, org_id or "")
+                        if related:
+                            data_parts.append(related)
+
+                # Si la pregunta es sobre actividades, también buscar en transcript_segments
+                if is_activity_question and primary == "activities" and docs:
+                    print(f"[chat] activity question detected, also searching transcript_segments")
+                    transcript_docs = await _search_transcripts_async(conn, message)
+                    if transcript_docs:
+                        data_parts.append(_transcripts_to_context(transcript_docs))
+                        print(f"[chat] found {len(transcript_docs)} transcript segments related to activities")
 
         data_context = "\n\n".join(data_parts) if data_parts else "No se encontraron datos relevantes."
         print(f"[chat] data_context=\n{data_context[:500]}")
 
-        # ── Paso 4: invocar LLM ───────────────────────────────────────────────
-        messages = build_prompt(self.system_prompt, data_context, user_id, user_name, org_id, history)
-        print(f"[chat] prompt_messages={len(messages)}, data_has_content={'No se encontraron' not in data_context}")
-        messages.append({"role": "user", "content": message})
-        answer_text = await _invoke_llm(messages)
-        print(f"[chat] answer_text={answer_text[:200] if answer_text else 'EMPTY'}")
+        if not data_parts:
+            answer_text = (
+                "Lo siento, no encontré información en la base de datos sobre ese curso en este momento. "
+                "Por favor, intenta con otra búsqueda o consulta algo relacionado."
+            )
+            print(f"[chat] no data fallback answer_text={answer_text}")
+        else:
+            # ── Paso 4: invocar LLM ───────────────────────────────────────────────
+            messages = build_prompt(self.system_prompt, data_context, user_id, user_name, org_id, history)
+            print(f"[chat] prompt_messages={len(messages)}, data_has_content={'No se encontraron' not in data_context}")
+            messages.append({"role": "user", "content": message})
+            answer_text = await _invoke_llm(messages)
+            print(f"[chat] answer_text={answer_text[:200] if answer_text else 'EMPTY'}")
 
         # ── Paso 5: guardar historial Redis + persistir en MongoDB ───────────
         history.append({"role": "user", "content": message})
         history.append({"role": "assistant", "content": answer_text})
         collection_used = sources[0].get("collection") if sources else None
-        asyncio.create_task(save_history(self.platform_id, user_id, history))
+        asyncio.create_task(save_history(self.platform_id, user_id, session_id, history))
         asyncio.create_task(persist_turn(
             platform_id=self.platform_id,
             user_id=user_id,
@@ -324,7 +403,53 @@ class ChatService:
         return bool(platform_cols & gencampus_cols)
 
 
-def _run_query(conn: dict, collection: str, mongo_filter: dict) -> list[dict]:
+async def _search_transcripts_async(conn: dict, query: str) -> list[dict]:
+    """Extrae el tema con LLM y busca en transcript_segments.text."""
+    topic = await _extract_topic(query)
+    print(f"[transcript] extracted topic='{topic}'")
+    return await asyncio.to_thread(
+        search_transcript_segments, conn["uri"], conn["database"], topic
+    )
+
+
+async def _extract_topic(query: str) -> str:
+    """Extrae el tema principal de búsqueda de la pregunta del usuario."""
+    from google import genai
+    from google.genai import types
+    import warnings
+
+    prompt = (
+        f"Extrae el tema o concepto principal que el usuario quiere buscar en videos/clases. "
+        f"Responde SOLO con el término o frase de búsqueda, sin explicaciones.\n\n"
+        f"Pregunta: \"{query}\"\n\n"
+        f"Tema de búsqueda:"
+    )
+
+    settings = get_settings()
+    client = genai.Client(api_key=settings.gemini_api_key)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
+        response = await client.aio.models.generate_content(
+            model=settings.gemini_model,
+            contents=prompt,
+            config=types.GenerateContentConfig(temperature=0),
+        )
+    return response.text.strip().strip('"').strip("'")
+
+def _transcripts_to_context(activities: list[dict]) -> str:
+    if not activities:
+        return "No se encontraron videos relacionados con ese tema."
+    lines = [f"### Videos encontrados ({len(activities)} actividades)\n"]
+    for i, act in enumerate(activities, 1):
+        lines.append(f"[{i}] Actividad: {act['name_activity']}")
+        lines.append(f"    ID: {act['activity_id']}")
+        for seg in act["segments"]:
+            lines.append(f"    [{seg['startTime']}s] {seg['text'].strip()}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _run_query(conn: dict, collection: str, mongo_filter: dict, sort: list | None = None, limit: int | None = None) -> list[dict]:
     """Ejecuta el find en MongoDB con el filtro ya generado."""
     from app.db.mongo_query import _serialize, _REQUIRE_FILTER, MAX_DOCS, ReadOnlyCollection
     from pymongo import MongoClient
@@ -336,7 +461,11 @@ def _run_query(conn: dict, collection: str, mongo_filter: dict) -> list[dict]:
     client = MongoClient(conn["uri"], serverSelectionTimeoutMS=8000)
     try:
         col = ReadOnlyCollection(client[conn["database"]][collection])
-        docs = [_serialize(doc) for doc in col._col.find(mongo_filter, limit=MAX_DOCS)]
+        n = limit or MAX_DOCS
+        cursor = col._col.find(mongo_filter, limit=n)
+        if sort:
+            cursor = cursor.sort(sort)
+        docs = [_serialize(doc) for doc in cursor]
         print(f"[mongo_query] collection={collection} filter={mongo_filter} docs={len(docs)}")
         return docs
     except Exception as e:
@@ -346,11 +475,243 @@ def _run_query(conn: dict, collection: str, mongo_filter: dict) -> list[dict]:
         client.close()
 
 
+def _expand_text_filter_to_keywords(mongo_filter: dict, valid_fields: list[str]) -> dict:
+    """
+    Convierte una búsqueda de texto completo en búsqueda por palabras clave individuales.
+    Ej: {"description": {"$regex": "cancer de mama"}} 
+    -> {"$or": [{"description": {"$regex": "cancer"}}, {"description": {"$regex": "mama"}}]}
+    """
+    if not isinstance(mongo_filter, dict):
+        return mongo_filter
+
+    result = {}
+    for key, value in mongo_filter.items():
+        if key.startswith("$"):
+            # Operadores MongoDB
+            if key == "$or" and isinstance(value, list):
+                result["$or"] = [_expand_text_filter_to_keywords(item, valid_fields) for item in value]
+            elif key == "$and" and isinstance(value, list):
+                result["$and"] = [_expand_text_filter_to_keywords(item, valid_fields) for item in value]
+            else:
+                result[key] = value
+        elif isinstance(value, dict) and "$regex" in value:
+            # Campo con búsqueda de regex - expandir a palabras clave
+            regex_pattern = value["$regex"]
+            options = value.get("$options", "")
+            
+            # Extraer palabras clave (palabras de 4+ caracteres, excluyendo stopwords)
+            keywords = _extract_search_keywords(regex_pattern)
+            
+            if len(keywords) > 1:
+                # Múltiples palabras: buscar cada una en el campo actual
+                or_conditions = []
+                for keyword in keywords:
+                    or_conditions.append({key: {"$regex": keyword, "$options": options}})
+                result["$or"] = or_conditions
+            else:
+                # Una sola palabra o frase corta: mantener como está
+                result[key] = value
+        else:
+            result[key] = value
+    
+    return result
+
+
+def _extract_search_keywords(text: str) -> list[str]:
+    """
+    Extrae palabras clave de un texto de búsqueda.
+    Aplica corrección ortográfica usando diccionario estático de términos comunes.
+    Filtra palabras cortas y stopwords comunes.
+    """
+    import re
+    
+    # Stopwords en español e inglés
+    stopwords = {
+        "de", "la", "el", "los", "las", "un", "una", "unos", "unas", "y", "o", "pero", "que", "con", "para", "por", "sin", "sobre", "entre", "desde", "hasta",
+        "the", "and", "or", "but", "with", "for", "from", "to", "in", "on", "at", "by", "of", "a", "an"
+    }
+    
+    # Diccionario de correcciones ortográficas comunes (faltas de tildes y errores frecuentes)
+    corrections = {
+        # Falta de tildes
+        "cancer": "cáncer",
+        "mama": "mamá", 
+        "papel": "papel",
+        "cafe": "café",
+        "universidad": "universidad",
+        "facil": "fácil",
+        "dificil": "difícil",
+        "musica": "música",
+        "gracias": "gracias",
+        "tambien": "también",
+        "estan": "están",
+        "estan": "están",
+        "aqui": "aquí",
+        "ahi": "ahí",
+        "alla": "allá",
+        "aun": "aún",
+        "como": "cómo",
+        "cuando": "cuándo",
+        "donde": "dónde",
+        "porque": "porque",
+        "que": "qué",
+        "quien": "quién",
+        "cual": "cuál",
+        "cuales": "cuáles",
+        
+        # Errores de escritura comunes
+        "actividad": "actividad",
+        "actividades": "actividades",
+        "curso": "curso",
+        "cursos": "cursos",
+        "clase": "clase",
+        "clases": "clases",
+        "leccion": "lección",
+        "lecciones": "lecciones",
+        "video": "video",
+        "videos": "videos",
+        "transcripcion": "transcripción",
+        "transcripciones": "transcripciones",
+        "grabacion": "grabación",
+        "grabaciones": "grabaciones",
+        "conferencia": "conferencia",
+        "conferencias": "conferencias",
+        
+        # Más correcciones comunes
+        "recursos": "recursos",
+        "material": "material",
+        "materiales": "materiales",
+        "informacion": "información",
+        "contenido": "contenido",
+        "contenidos": "contenidos",
+        "evaluacion": "evaluación",
+        "evaluaciones": "evaluaciones",
+        "certificado": "certificado",
+        "certificados": "certificados",
+        "progreso": "progreso",
+        "avance": "avance",
+        "completo": "completo",
+        "completado": "completado",
+        "inscrito": "inscrito",
+        "inscrita": "inscrita",
+        "inscripcion": "inscripción",
+        "registro": "registro",
+        
+        # Términos médicos comunes
+        "diabetes": "diabetes",
+        "hipertension": "hipertensión",
+        "cancer": "cáncer",
+        "infarto": "infarto",
+        "alergia": "alergia",
+        "alergias": "alergias",
+        "asma": "asma",
+        "bronquitis": "bronquitis",
+        "neumonia": "neumonía",
+        "gripe": "gripe",
+        "resfriado": "resfriado",
+        "dolor": "dolor",
+        "fiebre": "fiebre",
+        "tos": "tos",
+        "estornudo": "estornudo",
+        "estornudos": "estornudos",
+        "sintomas": "síntomas",
+        "tratamiento": "tratamiento",
+        "tratamientos": "tratamientos",
+        "medicamento": "medicamento",
+        "medicamentos": "medicamentos",
+        "diagnostico": "diagnóstico",
+        "prevencion": "prevención",
+        "salud": "salud",
+        "enfermedad": "enfermedad",
+        "enfermedades": "enfermedades",
+    }
+    
+    # Extraer palabras (letras y números, mínimo 4 caracteres)
+    words = re.findall(r'\b[a-zA-ZáéíóúÁÉÍÓÚñÑ0-9]{4,}\b', text.lower())
+    
+    # Aplicar correcciones ortográficas
+    corrected_words = []
+    for word in words:
+        corrected_words.append(corrections.get(word, word))
+    
+    # Filtrar stopwords y duplicados
+    keywords = [word for word in corrected_words if word not in stopwords]
+    
+    return list(set(keywords))  # Eliminar duplicados
+
+
+def _expand_events_text_filter_for_gencampus(mongo_filter: dict) -> dict:
+    """
+    Para GenCampus: si events viene filtrado por `description` con regex,
+    ampliar a búsqueda en `description` o `name`.
+    """
+    if not isinstance(mongo_filter, dict):
+        return mongo_filter
+
+    description_filter = mongo_filter.get("description")
+    if not (isinstance(description_filter, dict) and "$regex" in description_filter):
+        return mongo_filter
+
+    remaining = {k: v for k, v in mongo_filter.items() if k != "description"}
+    or_clause = [
+        {"description": description_filter},
+        {"name": description_filter},
+    ]
+
+    existing_or = remaining.pop("$or", None)
+    if isinstance(existing_or, list) and existing_or:
+        or_clause = existing_or + or_clause
+
+    text_filter = {"$or": or_clause}
+    if not remaining:
+        return text_filter
+    return {"$and": [remaining, text_filter]}
+
+
+def _validate_filter_fields(mongo_filter: dict, valid_fields: set) -> dict:
+    """
+    Valida y limpia un filtro MongoDB eliminando campos que no existen en el schema.
+    Mantiene los operadores MongoDB ($or, $and, $regex, etc).
+    """
+    if not isinstance(mongo_filter, dict) or not mongo_filter:
+        return mongo_filter
+    
+    result = {}
+    for key, value in mongo_filter.items():
+        # Mantener operadores MongoDB (comienzan con $)
+        if key.startswith("$"):
+            if key == "$or" and isinstance(value, list):
+                cleaned_or = []
+                for item in value:
+                    cleaned = _validate_filter_fields(item, valid_fields)
+                    if cleaned:
+                        cleaned_or.append(cleaned)
+                if cleaned_or:
+                    result["$or"] = cleaned_or
+            elif key == "$and" and isinstance(value, list):
+                cleaned_and = []
+                for item in value:
+                    cleaned = _validate_filter_fields(item, valid_fields)
+                    if cleaned:
+                        cleaned_and.append(cleaned)
+                if cleaned_and:
+                    result["$and"] = cleaned_and
+            else:
+                result[key] = value
+        # Validar campos reales
+        elif key in valid_fields:
+            result[key] = value
+        # Ignorar campos no válidos (como 'nombre' o 'org_id' en courseattendees)
+    
+    return result
+
+
 async def _fetch_related_async(
     docs: list[dict],
     conn: dict,
     cached: dict | None,
     query_hint: str,
+    org_id: str = "",
 ) -> str:
     RELATIONS = {
         "eventId":  "events",
@@ -389,7 +750,7 @@ async def _fetch_related_async(
     parts = []
     for label, result in zip(labels, results):
         if isinstance(result, list) and result:
-            parts.append(docs_to_context(label, result))
+            parts.append(docs_to_context(label, result, org_id))
             print(f"[chat] enriched {label} ({len(result)} docs)")
     return "\n\n".join(parts)
 

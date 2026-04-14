@@ -329,3 +329,144 @@ input.focus();
 </script>
 </body>
 </html>"""
+
+
+@router.get("/{platform_id}/recommendations", response_class=HTMLResponse)
+async def recommendations_widget(
+    platform_id: str,
+    request: Request,
+    api_key: str = "",
+    user_id: str = "",
+    org_id: str = "",
+    limit: int = 8,
+):
+    platform = await Platform.find_one(
+        Platform.platform_id == platform_id,
+        Platform.active == True,
+    )
+    if not platform:
+        raise HTTPException(404, "Plataforma no encontrada.")
+    if not api_key or platform.api_key_hash != _hash_api_key(api_key):
+        raise HTTPException(401, "API Key inválida.")
+    if not user_id:
+        raise HTTPException(400, "user_id es requerido.")
+
+    base_url = str(request.base_url).rstrip("/")
+    html = _build_recommendations_widget_html(
+        platform_id=platform_id,
+        platform_name=platform.name,
+        api_key=api_key,
+        user_id=user_id,
+        org_id=org_id,
+        limit=limit,
+        api_base_url=base_url,
+    )
+    return HTMLResponse(content=html)
+
+
+def _build_recommendations_widget_html(
+    platform_id: str,
+    platform_name: str,
+    api_key: str,
+    user_id: str,
+    org_id: str,
+    limit: int,
+    api_base_url: str,
+) -> str:
+    return f"""<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Recomendaciones {platform_name}</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f7fb; color: #111827; }}
+  #wrap {{ min-height: 100vh; display: flex; flex-direction: column; }}
+  #header {{ background: #111827; color: #fff; padding: 12px 14px; display: flex; gap: 10px; align-items: center; }}
+  #header h1 {{ font-size: 15px; font-weight: 600; flex: 1; }}
+  #refresh {{ border: none; border-radius: 8px; background: #374151; color: #fff; padding: 8px 10px; cursor: pointer; font-size: 12px; }}
+  #meta {{ font-size: 12px; color: #6b7280; padding: 10px 14px; }}
+  #list {{ padding: 0 14px 14px; display: flex; flex-direction: column; gap: 10px; }}
+  .card {{ background: #fff; border-radius: 12px; border: 1px solid #e5e7eb; padding: 12px; box-shadow: 0 1px 2px rgba(0,0,0,.04); }}
+  .tag {{ display: inline-block; font-size: 11px; color: #1d4ed8; background: #dbeafe; border-radius: 999px; padding: 3px 8px; margin-bottom: 8px; }}
+  .title {{ font-size: 14px; font-weight: 600; margin-bottom: 6px; line-height: 1.35; }}
+  .summary {{ font-size: 13px; color: #374151; line-height: 1.45; }}
+  .link {{ display: inline-block; margin-top: 8px; font-size: 12px; color: #2563eb; text-decoration: none; }}
+  .empty {{ padding: 18px 14px; color: #6b7280; font-size: 13px; }}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="header">
+    <h1>Recomendaciones - {platform_name}</h1>
+    <button id="refresh">Actualizar</button>
+  </div>
+  <div id="meta">Cargando recomendaciones...</div>
+  <div id="list"></div>
+</div>
+<script>
+const API_BASE = "{api_base_url}";
+const PLATFORM = "{platform_id}";
+const API_KEY = "{api_key}";
+const USER_ID = "{user_id}";
+const ORG_ID = "{org_id}";
+const LIMIT = {max(1, min(limit, 20))};
+
+const metaEl = document.getElementById("meta");
+const listEl = document.getElementById("list");
+
+function renderItems(items) {{
+  listEl.innerHTML = "";
+  if (!items.length) {{
+    listEl.innerHTML = '<div class="empty">Aun no hay recomendaciones para este usuario. Primero conversa un poco con el chat.</div>';
+    return;
+  }}
+  for (const item of items) {{
+    const card = document.createElement("div");
+    card.className = "card";
+    const linkHtml = item.url ? `<a class="link" href="${{item.url}}" target="_blank" rel="noopener">Abrir</a>` : "";
+    card.innerHTML = `
+      <div class="tag">${{item.collection}}</div>
+      <div class="title">${{item.title || "Sin titulo"}}</div>
+      <div class="summary">${{item.summary || ""}}</div>
+      ${{linkHtml}}
+    `;
+    listEl.appendChild(card);
+  }}
+}}
+
+async function loadRecommendations() {{
+  metaEl.textContent = "Actualizando recomendaciones...";
+  try {{
+    const res = await fetch(API_BASE + "/chat/recommendations", {{
+      method: "POST",
+      headers: {{
+        "Content-Type": "application/json",
+        "X-Platform-Id": PLATFORM,
+        "X-API-Key": API_KEY,
+      }},
+      body: JSON.stringify({{
+        user_id: USER_ID,
+        limit: LIMIT,
+        org_id: ORG_ID || null,
+      }}),
+    }});
+    const data = await res.json();
+    if (!res.ok) {{
+      throw new Error(data.detail || "Error al cargar recomendaciones");
+    }}
+    const tags = (data.based_on || []).join(", ");
+    metaEl.textContent = tags ? ("Basado en: " + tags) : "Sin suficientes senales en historial.";
+    renderItems(data.recommendations || []);
+  }} catch (e) {{
+    metaEl.textContent = "No se pudieron cargar las recomendaciones.";
+    listEl.innerHTML = '<div class="empty">Error consultando el servicio.</div>';
+  }}
+}}
+
+document.getElementById("refresh").addEventListener("click", loadRecommendations);
+loadRecommendations();
+</script>
+</body>
+</html>"""

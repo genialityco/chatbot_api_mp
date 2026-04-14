@@ -58,7 +58,11 @@ class Platform(Document):
             org = self.get_org(org_id)
             if org and org.system_prompt_override:
                 return org.system_prompt_override
-        return self.system_prompt.format(platform_name=self.name)
+        try:
+            return self.system_prompt.format(platform_name=self.name)
+        except KeyError:
+            # El prompt tiene placeholders que no son platform_name (ej: gencampus URLs)
+            return self.system_prompt
 
 
 # ─── Request / Response schemas ──────────────────────────────────────────────

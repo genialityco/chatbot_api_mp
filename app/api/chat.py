@@ -1,8 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException
 from app.core.auth import get_platform_context
 from app.models.platform import ChatRequest, ChatResponse
+from app.models.recommendation import RecommendationRequest, RecommendationResponse
 from app.services.chat_service import ChatService
 from app.services.history_service import clear_history, get_user_history, get_platform_history
+from app.services.recommendation_service import RecommendationService
 
 router = APIRouter(prefix="/chat", tags=["Chat"])
 
@@ -46,13 +48,35 @@ async def chat(
     return ChatResponse(**result)
 
 
+@router.post("/recommendations", response_model=RecommendationResponse)
+async def chat_recommendations(
+    request: RecommendationRequest,
+    ctx: dict = Depends(get_platform_context),
+):
+    """Recomendaciones personalizadas consumibles desde el iframe/chat."""
+    platform = ctx["platform"]
+    resolved_org_id = request.org_id or ctx["org_id"]
+    service = RecommendationService(platform=platform, org_id=resolved_org_id)
+    recommendations, keywords = await service.recommend_for_user(
+        user_id=request.user_id,
+        limit=request.limit,
+    )
+    return RecommendationResponse(
+        platform_id=ctx["platform_id"],
+        user_id=request.user_id,
+        based_on=keywords,
+        recommendations=recommendations,
+    )
+
+
 @router.delete("/history/{user_id}")
 async def delete_history(
     user_id: str,
+    session_id: str | None = None,
     ctx: dict = Depends(get_platform_context),
 ):
-    """Borra el historial de chat de un usuario en la plataforma."""
-    await clear_history(ctx["platform_id"], user_id)
+    """Borra el historial de chat. Si se pasa session_id, solo borra esa sesión."""
+    await clear_history(ctx["platform_id"], user_id, session_id)
     return {"message": "Historial eliminado.", "user_id": user_id}
 
 

@@ -22,6 +22,7 @@ settings = get_settings()
 
 PLATFORM_CONFIG = {
     "acho": {
+        "database": settings.acho_mongo_db,
         "collections": settings.schema_allowed_collections,
         "system_prompt": (
             "Eres un asistente experto en la plataforma ACHO. "
@@ -31,15 +32,29 @@ PLATFORM_CONFIG = {
         ),
     },
     "gencampus": {
+        "database": settings.gencampus_mongo_db,
         "collections": settings.gencampus_allowed_collections,
         "system_prompt": (
             "Eres un asistente experto en la plataforma GenCampus, una plataforma de aprendizaje en línea. "
             "Ayudas a los usuarios con información sobre sus cursos, actividades, módulos, quizzes y progreso académico. "
             "Responde siempre en el mismo idioma que el usuario. "
-            "Usa la información de contexto para dar respuestas precisas sobre el contenido educativo de GenCampus."
+            "Usa la información de contexto para dar respuestas precisas sobre el contenido educativo de GenCampus.\n\n"
+            "REGLAS DE FORMATO:\n"
+            "- Nunca muestres IDs de MongoDB en la respuesta fuera de una URL.\n"
+            "- Cuando el usuario pregunte por sus cursos, incluye al final este enlace a su perfil:\n"
+            f"  {settings.gencampus_base_url}/organization/{{organization_id}}/profile?tab=courses\n"
+            "  (reemplaza {organization_id} con el organization_id del usuario si está disponible)\n"
+            "- Cuando muestres un curso de la colección `events`, el ID del curso para la URL es el campo `_id` del evento.\n"
+            "- Cuando muestres un curso de la colección `courseattendees`, el ID del curso para la URL es el campo `event_id`.\n"
+            f"- Formato de URL de un curso: {settings.gencampus_base_url}/organization/{{org_id}}/course/{{_id_del_evento}}\n"
+            "- Cuando muestres una actividad o video, incluye su enlace:\n"
+            f"  {settings.gencampus_base_url}/organization/{{org_id}}/activitydetail/{{_id_de_la_actividad}}\n"
+            "- NUNCA uses el userId, user_id ni ningún ID de usuario en las URLs de cursos o actividades.\n"
+            "- Si no tienes el organization_id, usa el org_id del contexto del usuario."
         ),
     },
     "genlive": {
+        "database": settings.genlive_mongo_db,
         "collections": settings.schema_allowed_collections,
         "system_prompt": (
             "Eres un asistente experto en la plataforma GenLive. "
@@ -63,11 +78,27 @@ async def update():
             print(f"[SKIP] {platform.platform_id} — sin config definida")
             continue
 
+        target_database = cfg.get("database")
+        updated_connections = 0
         for conn in platform.db_connections:
+            if target_database and conn.database != target_database:
+                continue
             conn.collections = cfg["collections"]
+            updated_connections += 1
+
+        if updated_connections == 0:
+            print(
+                f"[SKIP] {platform.platform_id} — no se encontró db_connection "
+                f"para database='{target_database}'"
+            )
+            continue
+
         platform.system_prompt = cfg["system_prompt"]
         await platform.save()
-        print(f"[OK] {platform.platform_id} → {len(cfg['collections'])} colecciones")
+        print(
+            f"[OK] {platform.platform_id} → {updated_connections} conexión(es), "
+            f"{len(cfg['collections'])} colecciones"
+        )
 
     client.close()
 

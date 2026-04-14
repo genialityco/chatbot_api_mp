@@ -65,6 +65,7 @@ class Settings(BaseSettings):
 
     gencampus_mongo_uri: str = ""
     gencampus_mongo_db: str = "gencampus"
+    gencampus_base_url: str = "http://localhost:5173"
 
     genlive_mongo_uri: str = ""
     genlive_mongo_db: str = "live-events-v1"

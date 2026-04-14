@@ -28,6 +28,7 @@ _REQUIRE_FILTER = frozenset([
     "users", "members", "attendees", "posters",
     # GenCampus
     "courseattendees", "organizationusers", "quizattempts",
+    "transcript_segments",  # 114k docs — siempre requiere filtro de texto
 ])
 
 # ─── Bloqueo de escritura ────────────────────────────────────────────────────
@@ -57,6 +58,8 @@ def _serialize(doc: dict) -> dict:
     result = {}
     for k, v in doc.items():
         if k == "_id":
+            # Incluir _id serializado como string para que el LLM pueda usarlo en URLs
+            result["_id"] = str(v)
             continue
         if isinstance(v, datetime):
             result[k] = v.isoformat()
@@ -137,11 +140,20 @@ _FILTER_PROMPT = """Eres un experto en MongoDB. Tu tarea es generar un filtro de
 Fecha y hora actual: {now}
 
 Colección: `{collection}`
-Campos disponibles (usa EXACTAMENTE estos nombres): {fields}
+Campos disponibles (usa EXACTAMENTE estos nombres, solo estos): {fields}
 
 Pregunta del usuario: "{question}"
 
+INSTRUCCIONES DE CORRECCIÓN ORTOGRÁFICA:
+- Si la pregunta del usuario contiene faltas de ortografía, errores de tildes o términos médicos/educativos mal escritos, CORRÍGELOS AUTOMÁTICAMENTE antes de generar el filtro.
+- Ejemplos comunes: "cancer" → "cáncer", "mama" → "mamá", "informacion" → "información", "evaluacion" → "evaluación", "hipertension" → "hipertensión", "sintomas" → "síntomas", "endocrinologia" → "endocrinología".
+- Mantén el significado original pero corrige errores comunes de escritura.
+- Aplica la corrección antes de procesar la pregunta para generar el filtro.
+
 Responde ÚNICAMENTE con un objeto JSON válido que represente el filtro MongoDB.
+RESTRICCIONES CRÍTICAS:
+- SOLO usa campos de la lista "Campos disponibles". NO inventes ni uses campos que no estén listados.
+- Si la pregunta menciona un campo que no está disponible, ignóralo.
 - IMPORTANTE: usa los nombres de campo EXACTAMENTE como aparecen en "Campos disponibles".
 - Si el campo es user_id (con guión bajo), usa "user_id" — NO "userId".
 - Si el campo es event_id, usa "event_id" — NO "eventId".
@@ -150,6 +162,8 @@ Responde ÚNICAMENTE con un objeto JSON válido que represente el filtro MongoDB
 - Los campos que terminan en "Id" (camelCase) son ObjectId — usa el string hex de 24 chars.
 - Los campos con guión bajo como user_id, event_id son strings — NO los conviertas a ObjectId.
 - Si la pregunta contiene "_id: <valor>", genera {{"_id": "<valor>"}}.
+- NO inventes valores para campos enum — usa solo los valores que aparecen en la descripción del campo.
+- Si la pregunta pide "último", "más reciente", "más nuevo" o "último disponible", responde con {{}} (sin filtro).
 - Si no se necesita filtro, responde con {{}}.
 - NO incluyas explicaciones, solo el JSON.
 
@@ -157,6 +171,9 @@ Ejemplos:
 - campos: [startDate, name] + "eventos próximos" → {{"startDate": {{"$gte": "{now_date}"}}}}
 - campos: [user_id, event_id] + "mis cursos user_id 6625bf2f" → {{"user_id": "6625bf2f8315f2e5d60ab7a2"}}
 - campos: [userId, eventId] + "userId 672545c7" → {{"userId": "672545c7778fcbf45a1f2c83"}}
+- campos: [user_id, event_id, status] + "mis cursos user_id xxx nombre ACE" → {{"user_id": "xxx"}} (ignora "nombre" porque no existe)
+- "último curso disponible" → {{}}
+- "curso más reciente" → {{}}
 """
 
 
@@ -165,6 +182,23 @@ def _generate_filter_with_llm(question: str, collection: str, fields: list[str])
     from app.services.chat_service import get_llm
 
     now = datetime.now(timezone.utc)
+
+    # Si no hay campos del schema, usar campos comunes por colección
+    if not fields:
+        if collection == "events":
+            fields = ["name", "description", "startDate", "endDate", "location", "category", "tags"]
+        elif collection == "activities":
+            fields = ["name", "description", "content", "type", "duration", "order"]
+        elif collection == "courseattendees":
+            fields = ["user_id", "event_id", "status", "progress", "enrolledAt", "completedAt"]
+        elif collection == "transcript_segments":
+            fields = ["video_id", "text", "start_time", "end_time", "speaker"]
+        elif collection == "users":
+            fields = ["_id", "name", "email", "role", "organizationId"]
+        else:
+            # Campos genéricos para cualquier colección
+            fields = ["name", "title", "description", "text", "content", "status", "createdAt", "updatedAt"]
+
     prompt = _FILTER_PROMPT.format(
         now=now.isoformat(),
         now_date=now.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -187,14 +221,39 @@ def _generate_filter_with_llm(question: str, collection: str, fields: list[str])
         return {}
 
 
-async def generate_filter_async(question: str, collection: str, fields: list[str]) -> dict:
+async def generate_filter_async(question: str, collection: str, fields: list[str], enum_values: dict | None = None) -> dict:
     """Genera el filtro MongoDB usando el LLM configurado de forma async."""
     now = datetime.now(timezone.utc)
+
+    # Si no hay campos del schema, usar campos comunes por colección
+    if not fields:
+        if collection == "events":
+            fields = ["name", "description", "startDate", "endDate", "location", "category", "tags"]
+        elif collection == "activities":
+            fields = ["name", "description", "content", "type", "duration", "order"]
+        elif collection == "courseattendees":
+            fields = ["user_id", "event_id", "status", "progress", "enrolledAt", "completedAt"]
+        elif collection == "transcript_segments":
+            fields = ["video_id", "text", "start_time", "end_time", "speaker"]
+        elif collection == "users":
+            fields = ["_id", "name", "email", "role", "organizationId"]
+        else:
+            # Campos genéricos para cualquier colección
+            fields = ["name", "title", "description", "text", "content", "status", "createdAt", "updatedAt"]
+
+    # Construir descripción de campos con valores enum si existen
+    fields_desc = []
+    for f in fields:
+        if enum_values and f in enum_values:
+            fields_desc.append(f"{f} (valores: {', '.join(repr(v) for v in enum_values[f])})")
+        else:
+            fields_desc.append(f)
+
     prompt = _FILTER_PROMPT.format(
         now=now.isoformat(),
         now_date=now.strftime("%Y-%m-%dT%H:%M:%SZ"),
         collection=collection,
-        fields=", ".join(fields),
+        fields=", ".join(fields_desc),
         question=question,
     )
 
@@ -290,10 +349,72 @@ def fetch_collection_data(
     return docs
 
 
-def docs_to_context(collection: str, docs: list[dict]) -> str:
+def docs_to_context(collection: str, docs: list[dict], org_id: str = "") -> str:
     if not docs:
         return f"No se encontraron documentos en `{collection}`."
     lines = [f"### Datos reales de `{collection}` ({len(docs)} documentos)\n"]
+    base = settings.gencampus_base_url
     for i, doc in enumerate(docs, 1):
-        lines.append(f"[{i}] {json.dumps(doc, ensure_ascii=False, default=str)}")
+        clean = {k: v for k, v in doc.items()
+                 if not (isinstance(v, str) and len(v) == 24 and v.isalnum() and v != doc.get("_id"))}
+        # Construir URL directamente para evitar que el LLM confunda IDs
+        url = None
+        if collection == "events" and doc.get("_id") and org_id:
+            url = f"{base}/organization/{org_id}/course/{doc['_id']}"
+        elif collection == "activities" and doc.get("_id") and org_id:
+            url = f"{base}/organization/{org_id}/activitydetail/{doc['_id']}"
+
+        entry = {"name": doc.get("name", ""), **{k: v for k, v in doc.items() if k not in ("_id",)}}
+        if url:
+            entry["url"] = url
+        lines.append(f"[{i}] {json.dumps(entry, ensure_ascii=False, default=str)}")
     return "\n".join(lines)
+
+
+def search_transcript_segments(
+    uri: str,
+    database: str,
+    topic: str,
+    max_activities: int = 5,
+    segments_per_activity: int = 3,
+) -> list[dict]:
+    """
+    Busca segmentos de transcripción que contengan el tema indicado.
+    Agrupa por activity_id y devuelve los videos más relevantes con fragmentos de contexto.
+    """
+    client = MongoClient(uri, serverSelectionTimeoutMS=8000)
+    try:
+        col = client[database]["transcript_segments"]
+        # Buscar segmentos que mencionen el tema
+        cursor = col.find(
+            {"text": {"$regex": topic, "$options": "i"}},
+            {"text": 1, "activity_id": 1, "name_activity": 1, "startTime": 1},
+            limit=200,
+        )
+
+        # Agrupar por actividad
+        activities: dict[str, dict] = {}
+        for doc in cursor:
+            aid = str(doc.get("activity_id", ""))
+            name = doc.get("name_activity", "Sin nombre")
+            if aid not in activities:
+                activities[aid] = {
+                    "activity_id": aid,
+                    "name_activity": name,
+                    "segments": [],
+                }
+            if len(activities[aid]["segments"]) < segments_per_activity:
+                activities[aid]["segments"].append({
+                    "text": doc.get("text", ""),
+                    "startTime": doc.get("startTime"),
+                })
+
+        # Devolver las primeras N actividades
+        result = list(activities.values())[:max_activities]
+        print(f"[transcript] topic='{topic}' activities_found={len(result)}")
+        return result
+    except Exception as e:
+        print(f"[transcript] search error: {e}")
+        return []
+    finally:
+        client.close()

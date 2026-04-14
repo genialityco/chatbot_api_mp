@@ -67,20 +67,10 @@ def introspect_collection(
     collection: Collection,
     sample_size: int | None = None,
 ) -> dict[str, Any]:
-    """
-    Devuelve un dict con:
-      - name: nombre de la colección
-      - doc_count: total de documentos
-      - schema: mapa campo->tipo inferido
-      - sample_documents: lista de docs de ejemplo (sin _id)
-      - indexes: lista de índices
-      - field_frequency: frecuencia relativa de cada campo
-    """
     sample_size = sample_size or settings.schema_sample_docs
     total = collection.estimated_document_count()
     samples = list(collection.aggregate([{"$sample": {"size": sample_size}}]))
 
-    # Construir schema y frecuencia de campos
     field_counts: dict[str, int] = defaultdict(int)
     merged_schema: dict[str, str] = {}
 
@@ -96,7 +86,17 @@ def introspect_collection(
         for k, v in field_counts.items()
     }
 
-    # Índices
+    # Capturar valores enum para campos string con pocos valores únicos
+    enum_values: dict[str, list] = {}
+    for field, ftype in merged_schema.items():
+        if ftype == "string":
+            try:
+                distinct = collection.distinct(field)
+                if 1 < len(distinct) <= 10 and all(isinstance(v, str) for v in distinct):
+                    enum_values[field] = distinct
+            except Exception:
+                pass
+
     indexes = []
     try:
         for idx in collection.list_indexes():
@@ -108,22 +108,11 @@ def introspect_collection(
     except Exception:
         pass
 
-    # Limpiar samples para texto
-    clean_samples = []
-    for doc in samples[:3]:
-        doc.pop("_id", None)
-        # Truncar strings largos
-        truncated = {
-            k: (v[:120] + "..." if isinstance(v, str) and len(v) > 120 else v)
-            for k, v in doc.items()
-        }
-        clean_samples.append(truncated)
-
     return {
         "name": collection.name,
         "doc_count": total,
         "schema": merged_schema,
-        "sample_documents": clean_samples,
+        "enum_values": enum_values,
         "indexes": indexes,
         "field_frequency": field_frequency,
     }
@@ -259,6 +248,7 @@ def schema_to_text(db_info: dict[str, Any]) -> list[dict[str, str]]:
         "organizationusers": "Relación entre usuarios y organizaciones. Contiene roles y permisos dentro de cada organización.",
         "quizzes":           "Evaluaciones o cuestionarios asociados a cursos o módulos.",
         "quizattempts":      "Intentos de evaluación realizados por los usuarios. Contiene puntajes, respuestas y resultados.",
+        "transcript_segments": "Segmentos de transcripción de videos de actividades/clases. Contiene el texto hablado en cada video con su tiempo de inicio y fin. Usar para buscar videos o clases que hablen sobre un tema específico, una enfermedad, un medicamento o cualquier contenido temático.",
     }
 
     docs = []
@@ -281,7 +271,11 @@ def schema_to_text(db_info: dict[str, Any]) -> list[dict[str, str]]:
         ]
 
         for field in col["schema"].keys():
-            lines.append(f"  - {field}")
+            enum_vals = col.get("enum_values", {}).get(field)
+            if enum_vals:
+                lines.append(f"  - {field} (valores posibles: {', '.join(repr(v) for v in enum_vals)})")
+            else:
+                lines.append(f"  - {field}")
 
         if col.get("indexes"):
             lines += ["", "### Índices"]

@@ -11,7 +11,7 @@ from beanie import init_beanie
 from app.core.config import get_settings
 from app.models.platform import Platform
 from app.models.conversation import ChatTurn
-from app.api import chat, platforms
+from app.api import chat, platforms, recommendations
 from app.api import widget
 
 settings = get_settings()
@@ -50,6 +50,7 @@ app.add_middleware(
 
 app.include_router(chat.router)
 app.include_router(platforms.router)
+app.include_router(recommendations.router)
 app.include_router(widget.router)
 
 
@@ -65,6 +66,7 @@ async def root():
         "docs": "/docs",
         "usage": {
             "chat": "POST /chat  [X-Platform-Id, X-API-Key, X-Org-Id headers]",
+            "recommendations": "POST /recommendations  [X-Platform-Id, X-API-Key, X-Org-Id headers]",
             "admin": "POST /platforms  [X-Admin-Key header]",
         },
     }
