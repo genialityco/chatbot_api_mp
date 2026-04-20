@@ -57,7 +57,22 @@ PLATFORM_CONFIG = {
             "- Cuando muestres una actividad o video, incluye su enlace:\n"
             f"  {settings.gencampus_base_url}/organization/{{org_id}}/activitydetail/{{_id_de_la_actividad}}\n"
             "- NUNCA uses el userId, user_id ni ningún ID de usuario en las URLs de cursos o actividades.\n"
-            "- Si no tienes el organization_id, usa el org_id del contexto del usuario."
+            "- Si no tienes el organization_id, usa el org_id del contexto del usuario.\n\n"
+            "FLUJO DE EVALUACIÓN (PRUEBAS Y QUIZZES):\n"
+            "Si el usuario pide ser evaluado, realizar un examen, prueba o quiz, ESTÁS OBLIGADO a seguir este proceso interactivo paso a paso:\n"
+            "1. NO le preguntes sobre qué tema libre quiere ser evaluado.\n"
+            "2. Revisa el contexto de base de datos que se te proporciona para ver los cursos reales en los que está inscrito.\n"
+            "3. Si NO hay cursos ni nombres reales en tu contexto, dile amablemente que primero debe inscribirse en un curso para poder evaluarlo y termina ahí. NUNCA inventes nombres ni uses placeholders (como [Nombre del curso 1]).\n"
+            "4. Si SÍ hay cursos en tu contexto, muestra la lista enumerada con los nombres exactos y reales y pídele que escoja uno.\n"
+            "5. Una vez que el usuario elija el curso, formúlale UNA (1) sola pregunta a la vez sobre el contenido de ese curso. La pregunta DEBE ser muy aleatoria, variada y diferente a las que harías habitualmente; escoge detalles específicos, estudios, datos o módulos al azar para que ningún quiz sea igual a otro. La pregunta DEBE tener opciones enumeradas (ej. A, B, C, D) e indicar claramente si el usuario debe seleccionar una o varias opciones. Espera a que el usuario responda a esa pregunta.\n"
+
+            "6. Cuando el usuario responda, evalúa su respuesta (indicándole si acertó o falló con una breve retroalimentación) y formúlale la SIGUIENTE pregunta con sus opciones. Repite este ciclo hasta haberle hecho 3 preguntas en total.\n"
+            "7. Después de que el usuario responda la última pregunta, DEBES seguir este orden estricto para darle sus resultados:\n"
+            "   A) Haz un desglose pregunta por pregunta indicando si acertó o falló.\n"
+            "   B) Cuenta explícitamente en voz alta cuántas acertó (ej: 'Has acertado 0 de 3 preguntas').\n"
+            "   C) Muéstrale su calificación final.\n"
+            "   D) Finalmente, incluye OBLIGATORIAMENTE este bloque JSON oculto al final de tu mensaje:\n"
+            "```json\n{\n  \"quiz_result\": {\n    \"course_name\": \"Nombre del curso\",\n    \"score\": \"0/3\",\n    \"questions\": [\"Pregunta 1?\", \"Pregunta 2?\", \"Pregunta 3?\"],\n    \"user_answers\": [\"Resp 1\", \"Resp 2\", \"Resp 3\"],\n    \"feedback\": \"Resumen final...\"\n  }\n}\n```"
         ),
     },
     "genlive": {

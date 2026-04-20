@@ -337,7 +337,6 @@ class ChatService:
             "evaluame", "evalúame", "examen", "quiz", "prueba", "evaluado", "evaluarme", "preguntas"
         ]
         
-        import re
         pattern_personal = r'\b(?:' + '|'.join(_personal_kw) + r')\b'
         is_personal = bool(re.search(pattern_personal, message.lower()))
 
@@ -352,13 +351,25 @@ class ChatService:
             enriched_message = message
 
         # ── Paso 1: RAG + historial + clasificación de intención en paralelo ──────────────────────────────
-        (rag_context, sources), history, needs_db = await asyncio.gather(
-            asyncio.to_thread(self._rag_retrieve, message),
-            load_history(self.platform_id, user_id, session_id),
-            _requires_db_query(message),
-        )
+        # Fast-track: si usa ciertas palabras clave muy específicas, forzar DB sin preguntar al LLM
+        force_db_kw = ["evaluame", "evalúame", "examen", "quiz", "prueba", "evaluado", "evaluarme", "preguntas", "progreso", "inscrito", "video", "videos"]
+        pattern_force_db = r'\b(?:' + '|'.join(force_db_kw) + r')\b'
+        fast_track_db = bool(re.search(pattern_force_db, message.lower()))
 
-        print(f"[chat] Intent classifier: needs_db={needs_db}")
+        if fast_track_db:
+            (rag_context, sources), history = await asyncio.gather(
+                asyncio.to_thread(self._rag_retrieve, message),
+                load_history(self.platform_id, user_id, session_id),
+            )
+            needs_db = True
+        else:
+            (rag_context, sources), history, needs_db = await asyncio.gather(
+                asyncio.to_thread(self._rag_retrieve, message),
+                load_history(self.platform_id, user_id, session_id),
+                _requires_db_query(message),
+            )
+
+        print(f"[chat] Intent classifier: needs_db={needs_db} (fast_track={fast_track_db})")
 
         # ── Paso 2: generar filtro + cargar schema cache en paralelo ─────────
         data_parts: list[str] = []
@@ -373,152 +384,155 @@ class ChatService:
         is_activity_question = False
 
         if self.db_connections and needs_db:
-            # RAG may suggest a collection, but we rely heavily on heuristics for the content RAG
-            suggested_primary = sources[0].get("collection", "") if sources else ""
+            try:
+                # RAG may suggest a collection, but we rely heavily on heuristics for the content RAG
+                suggested_primary = sources[0].get("collection", "") if sources else ""
 
-            _activity_kw = ["actividad", "actividades", "clase", "clases", "lección", "lecciones"]
-            _module_kw = ["módulo", "modulo", "módulos", "modulos"]
-            _course_kw = ["curso", "cursos", "evento", "eventos", "programa", "diplomado", "certificación", "simposio", "congreso"]
-            _video_kw = ["video", "videos", "grabación", "grabacion", "transcripción", "transcripcion", "conferencia", "conferencias"]
-            _user_kw = ["usuario", "mi", "mis", "progreso", "inscrito"]
-            
-            msg_lower = message.lower()
-            
-            import re
-            def _has_kw(kws: list[str]) -> bool:
-                pattern = r'\b(?:' + '|'.join(kws) + r')\b'
-                return bool(re.search(pattern, msg_lower))
+                _activity_kw = ["actividad", "actividades", "clase", "clases", "lección", "lecciones"]
+                _module_kw = ["módulo", "modulo", "módulos", "modulos"]
+                _course_kw = ["curso", "cursos", "evento", "eventos", "programa", "diplomado", "certificación", "simposio", "congreso"]
+                _video_kw = ["video", "videos", "grabación", "grabacion", "transcripción", "transcripcion", "conferencia", "conferencias"]
+                _user_kw = ["usuario", "mi", "mis", "progreso", "inscrito"]
+                
+                msg_lower = message.lower()
+                
+                def _has_kw(kws: list[str]) -> bool:
+                    pattern = r'\b(?:' + '|'.join(kws) + r')\b'
+                    return bool(re.search(pattern, msg_lower))
 
-            # 1. Determinar colección principal en base a la intención del usuario
-            if is_personal or _has_kw(_user_kw):
-                primary = "courseattendees"
-            elif _has_kw(_video_kw):
-                primary = "transcript_segments"
-            elif _has_kw(_activity_kw):
-                primary = "activities"
-            elif _has_kw(_module_kw):
-                primary = "modules"
-            elif _has_kw(_course_kw):
-                primary = "events"
-            else:
-                # Fallback al RAG o a events por defecto
-                primary = suggested_primary or "events"
-
-            is_video_summary = primary == "transcript_segments" and _has_kw(["resumen", "resumir", "resúmen"])
-            is_activity_question = primary in ("activities", "modules")
-
-            if primary:
-                # Interceptar consultas dependientes de eventos en GenCampus
-                if self.platform_id == "gencampus" and primary in ("modules", "activities", "courseattendees"):
-                    # Si el usuario menciona "curso" o "evento", buscar primero en events para obtener el ID
-                    _course_kw_dep = ["curso", "evento", "programa", "diplomado", "certificación"]
-                    if _has_kw(_course_kw_dep):
-                        print(f"[chat] resolving event dependency for {primary} based on message")
-                        
-                        # Extraer el nombre del curso de la pregunta usando el extractor de temas genérico
-                        course_topic = await _extract_topic(message, "el nombre del curso o evento")
-                        if course_topic and course_topic.lower() not in _course_kw_dep:
-                            from bson import ObjectId
-                            # Usar fuzzy search en events para ese topic
-                            event_docs = await asyncio.to_thread(
-                                _run_query, conn, "events", 
-                                {"name": {"$regex": course_topic, "$options": "i"}}, 
-                                None, 2
-                            )
-                            if event_docs:
-                                event_ids = [str(d.get("_id", "")) for d in event_docs if d.get("_id")]
-                                if event_ids:
-                                    enriched_message += f" [Encontramos el curso {course_topic}, su event_id/eventId es: {event_ids[0]}]"
-                                    print(f"[chat] resolved event_id={event_ids[0]} for course mention '{course_topic}'")
-
-                collections_list = conn.get("collections")
-                print(f"[chat] loading cache with collections={collections_list}")
-                cached = load_schema_cache(conn["uri"], conn["database"], collections_list)
-                # Si no encuentra con collections específico, intentar con None (todas las colecciones)
-                if not cached and collections_list:
-                    print(f"[chat] cache miss with specific collections, retrying with None")
-                    cached = load_schema_cache(conn["uri"], conn["database"], None)
-                col_info = (cached or {}).get("collections", {}).get(primary, {})
-                print(f"[chat] cached_available={bool(cached)} primary={primary} col_info_keys={list(col_info.keys())}")
-                schema_fields = list(col_info.get("schema", {}).keys())
-                enum_values = col_info.get("enum_values", {})
-
-                # Generar filtro async solo si no es transcript_segments
-                if primary == "transcript_segments":
-                    docs = await _search_transcripts_async(conn, message)
+                # 1. Determinar colección principal en base a la intención del usuario
+                if is_personal or _has_kw(_user_kw):
+                    primary = "courseattendees"
+                elif _has_kw(_video_kw):
+                    primary = "transcript_segments"
+                elif _has_kw(_activity_kw):
+                    primary = "activities"
+                elif _has_kw(_module_kw):
+                    primary = "modules"
+                elif _has_kw(_course_kw):
+                    primary = "events"
                 else:
-                    # Intento de generar filtro
-                    mongo_filter = await generate_filter_async(enriched_message, primary, schema_fields, enum_values)
-                    print(f"[chat] schema_fields={schema_fields} mongo_filter_before={json.dumps(mongo_filter, default=str)}")
-                    
-                    # Si sabemos que estamos buscando un evento en dependencias, forzar o inyectar el event_id en el filtro
-                    if self.platform_id == "gencampus" and primary in ("modules", "activities") and "eventId es:" in enriched_message:
-                        import re as regex
-                        match = regex.search(r"eventId es:\s*([a-fA-F0-9]{24})", enriched_message)
-                        if match:
-                            event_id_val = match.group(1)
-                            # Si no hay filtro, lo creamos
-                            if not mongo_filter:
-                                mongo_filter = {"$or": [{"eventId": event_id_val}, {"event_id": event_id_val}]}
-                            else:
-                                # Limpiamos cualquier búsqueda errónea por nombre/título y priorizamos el evento
-                                mongo_filter.pop("name", None)
-                                mongo_filter.pop("title", None)
+                    # Fallback al RAG o a events por defecto
+                    primary = suggested_primary or "events"
+
+                is_video_summary = primary == "transcript_segments" and _has_kw(["resumen", "resumir", "resúmen"])
+                is_activity_question = primary in ("activities", "modules")
+
+                if primary:
+                    # Interceptar consultas dependientes de eventos en GenCampus
+                    if self.platform_id == "gencampus" and primary in ("modules", "activities", "courseattendees"):
+                        # Si el usuario menciona "curso" o "evento", buscar primero en events para obtener el ID
+                        _course_kw_dep = ["curso", "evento", "programa", "diplomado", "certificación"]
+                        if _has_kw(_course_kw_dep):
+                            print(f"[chat] resolving event dependency for {primary} based on message")
+                            
+                            # Extraer el nombre del curso de la pregunta usando el extractor de temas genérico
+                            course_topic = await _extract_topic(message, "el nombre del curso o evento")
+                            if course_topic and course_topic.lower() not in _course_kw_dep:
+                                from bson import ObjectId
+                                # Usar fuzzy search en events para ese topic
+                                event_docs = await asyncio.to_thread(
+                                    _run_query, conn, "events", 
+                                    {"name": {"$regex": course_topic, "$options": "i"}}, 
+                                    None, 2
+                                )
+                                if event_docs:
+                                    event_ids = [str(d.get("_id", "")) for d in event_docs if d.get("_id")]
+                                    if event_ids:
+                                        enriched_message += f" [Encontramos el curso {course_topic}, su event_id/eventId es: {event_ids[0]}]"
+                                        print(f"[chat] resolved event_id={event_ids[0]} for course mention '{course_topic}'")
+
+                    collections_list = conn.get("collections")
+                    print(f"[chat] loading cache with collections={collections_list}")
+                    cached = load_schema_cache(conn["uri"], conn["database"], collections_list)
+                    # Si no encuentra con collections específico, intentar con None (todas las colecciones)
+                    if not cached and collections_list:
+                        print(f"[chat] cache miss with specific collections, retrying with None")
+                        cached = load_schema_cache(conn["uri"], conn["database"], None)
+                    col_info = (cached or {}).get("collections", {}).get(primary, {})
+                    print(f"[chat] cached_available={bool(cached)} primary={primary} col_info_keys={list(col_info.keys())}")
+                    schema_fields = list(col_info.get("schema", {}).keys())
+                    enum_values = col_info.get("enum_values", {})
+
+                    # Generar filtro async solo si no es transcript_segments
+                    if primary == "transcript_segments":
+                        docs = await _search_transcripts_async(conn, message)
+                    else:
+                        # Intento de generar filtro
+                        mongo_filter = await generate_filter_async(enriched_message, primary, schema_fields, enum_values)
+                        print(f"[chat] schema_fields={schema_fields} mongo_filter_before={json.dumps(mongo_filter, default=str)}")
+                        
+                        # Si sabemos que estamos buscando un evento en dependencias, forzar o inyectar el event_id en el filtro
+                        if self.platform_id == "gencampus" and primary in ("modules", "activities") and "eventId es:" in enriched_message:
+                            match = re.search(r"eventId es:\s*([a-fA-F0-9]{24})", enriched_message)
+                            if match:
+                                event_id_val = match.group(1)
+                                # Si no hay filtro, lo creamos
                                 if not mongo_filter:
                                     mongo_filter = {"$or": [{"eventId": event_id_val}, {"event_id": event_id_val}]}
                                 else:
-                                    # Si había más cosas en el filtro, las anidamos con un AND
-                                    mongo_filter = {"$and": [{"$or": [{"eventId": event_id_val}, {"event_id": event_id_val}]}, mongo_filter]}
-                            print(f"[chat] forced event_id filter created from enriched message: {mongo_filter}")
+                                    # Limpiamos cualquier búsqueda errónea por nombre/título y priorizamos el evento
+                                    mongo_filter.pop("name", None)
+                                    mongo_filter.pop("title", None)
+                                    if not mongo_filter:
+                                        mongo_filter = {"$or": [{"eventId": event_id_val}, {"event_id": event_id_val}]}
+                                    else:
+                                        # Si había más cosas en el filtro, las anidamos con un AND
+                                        mongo_filter = {"$and": [{"$or": [{"eventId": event_id_val}, {"event_id": event_id_val}]}, mongo_filter]}
+                                print(f"[chat] forced event_id filter created from enriched message: {mongo_filter}")
 
-                    # Expandir búsquedas de texto a palabras clave individuales
-                    mongo_filter = _expand_text_filter_to_keywords(mongo_filter, schema_fields)
-                    print(f"[chat] mongo_filter_after_fuzzy_options={json.dumps(mongo_filter, default=str)}")
-                    # Validar que el filtro solo use campos que existen en el schema (solo si tenemos schema)
-                    if schema_fields:
-                        mongo_filter = _validate_filter_fields(mongo_filter, set(schema_fields))
-                        print(f"[chat] mongo_filter_after_validation={json.dumps(mongo_filter, default=str)}")
-                    else:
-                        print(f"[chat] WARNING: no schema_fields available, skipping filter validation")
-                    if self.platform_id == "gencampus" and primary == "events":
-                        mongo_filter = _expand_events_text_filter_for_gencampus(mongo_filter)
-                    # Detectar si pide el último/más reciente → ordenar por fecha desc, limit 1
-                    _latest_kw = ["último", "ultimo", "más reciente", "mas reciente", "más nuevo", "mas nuevo", "latest", "newest"]
-                    is_latest = any(kw in message.lower() for kw in _latest_kw)
-                    date_fields = ["datetime_from", "datetime_to", "startDate", "start_date", "createdAt", "created_at", "date"]
-                    sort_field = next((f for f in date_fields if f in schema_fields), None)
-                    # Fallback: ordenar por _id desc (ObjectId tiene timestamp embebido)
-                    if is_latest and not sort_field:
-                        sort_field = "_id"
-                    sort = [(sort_field, -1)] if is_latest and sort_field else None
-                    limit = 1 if is_latest else None
-                    print(f"[chat] is_latest={is_latest} sort_field={sort_field} sort={sort} limit={limit}")
-                    # Limitar la respuesta general a un máximo de 5 documentos
-                    docs = await asyncio.to_thread(_run_query, conn, primary, mongo_filter, sort, limit)
-                    if docs and limit is None:
-                        docs = docs[:5]
-                print(f"[chat] primary={primary} docs={len(docs)}")
-
-                if docs:
-                    if primary == "transcript_segments":
-                        if is_video_summary:
-                            data_parts.append(_transcripts_to_summary_context(docs))
+                        # Expandir búsquedas de texto a palabras clave individuales
+                        mongo_filter = _expand_text_filter_to_keywords(mongo_filter, schema_fields)
+                        print(f"[chat] mongo_filter_after_fuzzy_options={json.dumps(mongo_filter, default=str)}")
+                        # Validar que el filtro solo use campos que existen en el schema (solo si tenemos schema)
+                        if schema_fields:
+                            mongo_filter = _validate_filter_fields(mongo_filter, set(schema_fields))
+                            print(f"[chat] mongo_filter_after_validation={json.dumps(mongo_filter, default=str)}")
                         else:
-                            data_parts.append(_transcripts_to_context(docs))
-                    else:
-                        data_parts.append(docs_to_context(primary, docs, org_id or ""))
-                        related = await _fetch_related_async(docs, conn, cached, enriched_message, org_id or "")
-                        if related:
-                            data_parts.append(related)
+                            print(f"[chat] WARNING: no schema_fields available, skipping filter validation")
+                        if self.platform_id == "gencampus" and primary == "events":
+                            mongo_filter = _expand_events_text_filter_for_gencampus(mongo_filter)
+                        # Detectar si pide el último/más reciente → ordenar por fecha desc, limit 1
+                        _latest_kw = ["último", "ultimo", "más reciente", "mas reciente", "más nuevo", "mas nuevo", "latest", "newest"]
+                        is_latest = any(kw in message.lower() for kw in _latest_kw)
+                        date_fields = ["datetime_from", "datetime_to", "startDate", "start_date", "createdAt", "created_at", "date"]
+                        sort_field = next((f for f in date_fields if f in schema_fields), None)
+                        # Fallback: ordenar por _id desc (ObjectId tiene timestamp embebido)
+                        if is_latest and not sort_field:
+                            sort_field = "_id"
+                        sort = [(sort_field, -1)] if is_latest and sort_field else None
+                        limit = 1 if is_latest else None
+                        print(f"[chat] is_latest={is_latest} sort_field={sort_field} sort={sort} limit={limit}")
+                        # Limitar la respuesta general a un máximo de 5 documentos
+                        docs = await asyncio.to_thread(_run_query, conn, primary, mongo_filter, sort, limit)
+                        if docs and limit is None:
+                            docs = docs[:5]
+                    print(f"[chat] primary={primary} docs={len(docs)}")
 
-                # Si la pregunta es sobre actividades, también buscar en transcript_segments
-                if is_activity_question and primary == "activities" and docs:
-                    print(f"[chat] activity question detected, also searching transcript_segments")
-                    transcript_docs = await _search_transcripts_async(conn, message)
-                    if transcript_docs:
-                        transcript_docs = transcript_docs[:5]
-                        data_parts.append(_transcripts_to_context(transcript_docs))
-                        print(f"[chat] found {len(transcript_docs)} transcript segments related to activities")
+                    if docs:
+                        if primary == "transcript_segments":
+                            if is_video_summary:
+                                data_parts.append(_transcripts_to_summary_context(docs))
+                            else:
+                                data_parts.append(_transcripts_to_context(docs))
+                        else:
+                            data_parts.append(docs_to_context(primary, docs, org_id or ""))
+                            related = await _fetch_related_async(docs, conn, cached, enriched_message, org_id or "")
+                            if related:
+                                data_parts.append(related)
+
+                    # Si la pregunta es sobre actividades, también buscar en transcript_segments
+                    if is_activity_question and primary == "activities" and docs:
+                        print(f"[chat] activity question detected, also searching transcript_segments")
+                        transcript_docs = await _search_transcripts_async(conn, message)
+                        if transcript_docs:
+                            transcript_docs = transcript_docs[:5]
+                            data_parts.append(_transcripts_to_context(transcript_docs))
+                            print(f"[chat] found {len(transcript_docs)} transcript segments related to activities")
+            except Exception as e:
+                import traceback
+                print(f"[chat] CRITICAL ERROR IN DB PHASE: {e}")
+                traceback.print_exc()
 
         data_context = "\n\n".join(data_parts) if data_parts else "No se encontraron datos relevantes en la base de datos para esta consulta."
         print(f"[chat] data_context_len={len(data_context)}")
@@ -557,34 +571,8 @@ class ChatService:
                 "proporcionado arriba, reemplazando {{{{RESUMEN_AQUI}}}} con tu descripción o resumen."
             )
             
-        # Flujo de evaluación
-        quiz_instructions = (
-            "\n\n## FLUJO DE EVALUACIÓN (QUIZ)\n"
-            "Si el usuario pide ser evaluado, realizar un examen, prueba o quiz, SIGUE ESTE FLUJO ESTRICTAMENTE PASO A PASO:\n"
-            "Paso 1. Revisa los datos de la base de datos en tu contexto (courseattendees, events, etc.) para ver los cursos. "
-            "MUESTRA explícitamente una lista con los nombres de esos cursos y pídele que elija uno para evaluarlo. "
-            "NO le preguntes sobre qué tema general quiere ser evaluado; oblígalo a elegir de la lista.\n"
-            "Paso 2. Espera a que el usuario responda eligiendo un curso.\n"
-            "Paso 3. Una vez elegido el curso, formúlale entre 1 y 3 preguntas sobre el contenido de ese curso. "
-            "Las preguntas pueden ser de opción múltiple o abiertas. Presenta todas las preguntas en un solo mensaje.\n"
-            "Paso 4. Espera a que el usuario responda las preguntas.\n"
-            "Paso 5. Evalúa sus respuestas, dile cuántas acertó y dale una pequeña retroalimentación.\n"
-            "Paso 6. MUY IMPORTANTE: En el mismo mensaje donde le das el resultado final, DEBES incluir AL FINAL de todo tu texto un bloque de código JSON oculto exactamente con este formato (no lo omitas):\n"
-            "```json\n"
-            "{\n"
-            "  \"quiz_result\": {\n"
-            "    \"course_name\": \"Nombre del curso\",\n"
-            "    \"score\": \"1/3\",\n"
-            "    \"questions\": [\"Pregunta 1?\"],\n"
-            "    \"user_answers\": [\"Respuesta 1\"],\n"
-            "    \"feedback\": \"Resumen de su rendimiento\"\n"
-            "  }\n"
-            "}\n"
-            "```"
-        )
-        
-        # Añadir las plantillas y flujos al data_context
-        full_context = data_context + templates_context + quiz_instructions
+        # Añadir las plantillas al data_context
+        full_context = data_context + templates_context
 
         messages = build_prompt(
             self.system_prompt,
@@ -597,23 +585,32 @@ class ChatService:
         )
         print(f"[chat] prompt_messages={len(messages)}, data_has_content={'No se encontraron' not in data_context}")
         messages.append({"role": "user", "content": message})
-        answer_text = await _invoke_llm(messages)
+        
+        # Aumentar la temperatura y añadir un ruido algorítmico si estamos en modo evaluación
+        # para forzar la aleatoriedad en las preguntas
+        chat_temperature = 0.2
+        if is_personal and any(kw in message.lower() for kw in ["evaluame", "evalúame", "examen", "quiz", "prueba", "evaluado", "evaluarme", "preguntas"]):
+            chat_temperature = 0.6
+            import time
+            messages[-1]["content"] += f"\n\n[System note: Seed temporal para forzar variedad en este quiz: {time.time()}]"
+        
+        answer_text = await _invoke_llm(messages, temperature=chat_temperature)
         print(f"[chat] answer_text={answer_text[:200] if answer_text else 'EMPTY'}")
 
         # ── Paso 5: guardar historial Redis + persistir en MongoDB ───────────
         
         # Interceptar resultado de quiz si el LLM emitió el bloque JSON
-        import re
-        quiz_match = re.search(r"```json\s*(\{.*?\"quiz_result\".*?\})\s*```", answer_text, re.DOTALL)
+        quiz_match = re.search(r"```(?:json)?\s*(\{.*?\"quiz_result\".*?\})\s*```", answer_text, re.DOTALL | re.IGNORECASE)
+        quiz_save_coro = None
         if quiz_match:
             quiz_json_str = quiz_match.group(1)
             try:
-                import json
                 quiz_data = json.loads(quiz_json_str)
-                # Guardar el quiz de forma asíncrona
+                # Preparar corutina para guardar el quiz de forma asíncrona segura
                 uri = self.db_connections[0]["uri"] if self.db_connections else settings.meta_mongodb_uri
                 database = self.db_connections[0]["database"] if self.db_connections else settings.meta_mongodb_db
-                asyncio.create_task(_save_quiz_result(uri, database, self.platform_id, user_id, org_id, quiz_data))
+                quiz_save_coro = _save_quiz_result(uri, database, self.platform_id, user_id, org_id, quiz_data)
+                
                 # Remover el bloque json del texto que verá el usuario
                 answer_text = answer_text[:quiz_match.start()] + answer_text[quiz_match.end():]
                 answer_text = answer_text.strip()
@@ -629,7 +626,7 @@ class ChatService:
         collection_used = sources[0].get("collection") if sources else None
         
         # Esperar a que se completen las operaciones de guardado para evitar "Task was destroyed"
-        await asyncio.gather(
+        tasks_to_gather = [
             save_history(self.platform_id, user_id, session_id, history),
             persist_turn(
                 platform_id=self.platform_id,
@@ -642,7 +639,11 @@ class ChatService:
                 collection_used=collection_used,
                 sources=sources,
             )
-        )
+        ]
+        if quiz_save_coro:
+            tasks_to_gather.append(quiz_save_coro)
+            
+        await asyncio.gather(*tasks_to_gather)
 
         return {
             "answer": answer_text,
@@ -722,7 +723,8 @@ async def _requires_db_query(query: str) -> bool:
         "- Busca un video donde mencionen el ayuno intermitente.\n"
         "- ¿Qué módulos tiene el curso ENDIMET?\n"
         "- ¿Cuáles cursos hay disponibles sobre la diabetes?\n"
-        "- Quiero que me evalúes o me hagas un examen de mis cursos.\n\n"
+        "- Quiero que me evalúes o me hagas un examen de mis cursos.\n"
+        "- Hazme una prueba.\n\n"
         "Ejemplos que NO requieren base de datos (se responden con conocimiento general o de la documentación):\n"
         "- Hola, ¿cómo estás?\n"
         "- Explícame qué es el hipotiroidismo y sus síntomas.\n"
@@ -937,7 +939,6 @@ async def _build_gencampus_cards_template_async(conn: dict, docs: list[dict], co
             base_activity_url = f"{base_url}/organization/{org_id}/activitydetail/{doc.get('activity_id')}"
             
             if segments:
-                import json, urllib.parse
                 first_time = segments[0].get("startTime", 0)
                 fragments_json = urllib.parse.quote(json.dumps(segments))
                 url = f"{base_activity_url}?t={first_time}&fragments={fragments_json}"
