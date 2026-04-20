@@ -603,12 +603,10 @@ class ChatService:
         # ── Paso 5: guardar historial Redis + persistir en MongoDB ───────────
         
         # Interceptar resultado de quiz si el LLM emitió el bloque JSON
-        import re
         quiz_match = re.search(r"```json\s*(\{.*?\"quiz_result\".*?\})\s*```", answer_text, re.DOTALL)
         if quiz_match:
             quiz_json_str = quiz_match.group(1)
             try:
-                import json
                 quiz_data = json.loads(quiz_json_str)
                 # Guardar el quiz de forma asíncrona
                 uri = self.db_connections[0]["uri"] if self.db_connections else settings.meta_mongodb_uri
