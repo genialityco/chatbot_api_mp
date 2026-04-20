@@ -7,8 +7,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+import urllib.parse
 import uuid
-from typing import Any
+from datetime import datetime
+from typing import Any, AsyncGenerator
 
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -80,6 +83,41 @@ async def _invoke_gemini(messages: list[dict], temperature: float = 0.2) -> str:
     return response.text
 
 
+async def _invoke_gemini_stream(messages: list[dict], temperature: float = 0.2) -> AsyncGenerator[str, None]:
+    """Llama a Gemini con streaming nativo."""
+    import warnings
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=settings.gemini_api_key)
+
+    system_instruction = None
+    contents = []
+    for msg in messages:
+        if msg["role"] == "system":
+            system_instruction = msg["content"]
+        elif msg["role"] == "user":
+            contents.append(types.Content(role="user", parts=[types.Part(text=msg["content"])]))
+        elif msg["role"] == "model":
+            contents.append(types.Content(role="model", parts=[types.Part(text=msg["content"])]))
+
+    config = types.GenerateContentConfig(
+        temperature=temperature,
+        system_instruction=system_instruction,
+    )
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
+        response_stream = await client.aio.models.generate_content_stream(
+            model=settings.gemini_model,
+            contents=contents,
+            config=config,
+        )
+        async for chunk in response_stream:
+            if chunk.text:
+                yield chunk.text
+
+
 async def _invoke_llm(messages: list[dict], temperature: float = 0.2) -> str:
     """Invoca el LLM configurado con lista de mensajes en formato dict."""
     try:
@@ -100,6 +138,31 @@ async def _invoke_llm(messages: list[dict], temperature: float = 0.2) -> str:
         return response.content
     except Exception as e:
         print(f"[llm] invoke error: {e}")
+        raise
+
+
+async def _invoke_llm_stream(messages: list[dict], temperature: float = 0.2) -> AsyncGenerator[str, None]:
+    """Invoca el LLM configurado devolviendo un generador de streaming."""
+    try:
+        if settings.llm_provider == "gemini":
+            async for chunk in _invoke_gemini_stream(messages, temperature):
+                yield chunk
+            return
+
+        lc_messages = []
+        for msg in messages:
+            if msg["role"] == "system":
+                lc_messages.append(SystemMessage(content=msg["content"]))
+            elif msg["role"] == "user":
+                lc_messages.append(HumanMessage(content=msg["content"]))
+            elif msg["role"] == "model":
+                lc_messages.append(AIMessage(content=msg["content"]))
+
+        llm = get_llm(temperature)
+        async for chunk in llm.astream(lc_messages):
+            yield chunk.content
+    except Exception as e:
+        print(f"[llm] stream invoke error: {e}")
         raise
 
 
@@ -129,14 +192,12 @@ SYSTEM_TEMPLATE = """{system_prompt}
 - Si el usuario pregunta por recomendaciones, usa los cursos/eventos disponibles para sugerir.
 - Responde en el mismo idioma que el usuario.
 - NO digas que no tienes información si los datos están presentes arriba.
-- Nunca muestres IDs de MongoDB en la respuesta fuera de una URL.
-- Cuando muestres un curso de `events`, el ID para la URL es el campo `_id` del evento (NO el userId).
-- Cuando muestres un curso de `courseattendees`, el ID para la URL es el campo `event_id`.
-- Cuando muestres una actividad, el ID para la URL es el `_id` de la actividad.
-- Formato de URLs de GenCampus:
-  - Perfil/cursos del usuario: {base_url}/organization/{{org_id}}/profile?tab=courses
-  - Curso: {base_url}/organization/{{org_id}}/course/{{_id_del_evento}}
-  - Actividad/video: {base_url}/organization/{{org_id}}/activitydetail/{{_id_actividad}}
+- Nunca muestres IDs de MongoDB en la respuesta.
+- IMPORTANTE: Cuando haya tarjetas HTML disponibles, úsalas inyectando tu contenido en {{{{RESUMEN_AQUI}}}}. NO inventes URLs ni repitas enlaces sueltos en el texto.
+- Tu respuesta debe ser natural, aportando el contexto general y la respuesta a la pregunta del usuario.
+
+## Instrucciones adicionales
+{extra_instructions}
 
 ## Corrección ortográfica
 - Si el usuario escribe con faltas de ortografía, errores de tildes o términos médicos/educativos mal escritos, CORRÍGELOS AUTOMÁTICAMENTE en tu respuesta.
@@ -164,6 +225,7 @@ def build_prompt(
     user_name: str | None,
     org_id: str | None,
     history: list[dict],
+    extra_instructions: str | None = None,
 ) -> list[dict]:
     """Construye lista de mensajes en formato dict {role, content}."""
     has_data = bool(data_context) and "No se encontraron" not in data_context
@@ -177,6 +239,7 @@ def build_prompt(
             user_name=user_name or "desconocido",
             org_id=org_id or "N/A",
             base_url=settings.gencampus_base_url,
+            extra_instructions=extra_instructions or "",
         )
     else:
         system_content = NO_CONTEXT_TEMPLATE.format(system_prompt=system_prompt)
@@ -213,6 +276,32 @@ def _to_langchain_history(
 
 # ─── Chat service ─────────────────────────────────────────────────────────────
 
+async def _save_quiz_result(uri: str, database: str, platform_id: str, user_id: str, org_id: str | None, quiz_data: dict) -> None:
+    """Guarda el resultado del quiz generado por el LLM en una colección dedicada."""
+    from pymongo import MongoClient
+    import datetime
+    
+    try:
+        client = MongoClient(uri, serverSelectionTimeoutMS=5000)
+        db = client[database]
+        
+        # Colección ej: quizzes_gencampus
+        col_name = f"quizzes_{platform_id}"
+        
+        doc = {
+            "user_id": user_id,
+            "org_id": org_id,
+            "created_at": datetime.datetime.now(datetime.timezone.utc),
+            "quiz_data": quiz_data.get("quiz_result", quiz_data)
+        }
+        
+        db[col_name].insert_one(doc)
+        print(f"[quiz] Quiz result saved successfully in {col_name} for user {user_id}")
+    except Exception as e:
+        print(f"[quiz] Error saving quiz result: {e}")
+    finally:
+        client.close()
+
 class ChatService:
     def __init__(
         self,
@@ -242,11 +331,15 @@ class ChatService:
 
         # Detectar si la pregunta es personal o una consulta general del catálogo
         _personal_kw = [
-            "mis ", "mi ", "mío", "mía", "tengo", "he tomado", "he completado",
+            "mis", "mi", "mío", "mía", "tengo", "he tomado", "he completado",
             "mi progreso", "mis certificados", "mis inscripciones", "estoy inscrito",
-            "my ", "i have", "i am enrolled",
+            "my", "i have", "i am enrolled",
+            "evaluame", "evalúame", "examen", "quiz", "prueba", "evaluado", "evaluarme", "preguntas"
         ]
-        is_personal = any(kw in message.lower() for kw in _personal_kw)
+        
+        import re
+        pattern_personal = r'\b(?:' + '|'.join(_personal_kw) + r')\b'
+        is_personal = bool(re.search(pattern_personal, message.lower()))
 
         if is_personal:
             ctx_parts = [f"{user_id_field}: {user_id}"]
@@ -258,32 +351,86 @@ class ChatService:
             # Consulta general — sin contexto de usuario
             enriched_message = message
 
-        # ── Paso 1: RAG + historial en paralelo ──────────────────────────────
-        (schema_context, sources), history = await asyncio.gather(
+        # ── Paso 1: RAG + historial + clasificación de intención en paralelo ──────────────────────────────
+        (rag_context, sources), history, needs_db = await asyncio.gather(
             asyncio.to_thread(self._rag_retrieve, message),
             load_history(self.platform_id, user_id, session_id),
+            _requires_db_query(message),
         )
+
+        print(f"[chat] Intent classifier: needs_db={needs_db}")
 
         # ── Paso 2: generar filtro + cargar schema cache en paralelo ─────────
         data_parts: list[str] = []
-        if sources and self.db_connections:
-            conn = self.db_connections[0]
-            primary = sources[0].get("collection", "")
+        if rag_context:
+            data_parts.append("### CONOCIMIENTO DE LA PLATAFORMA (RAG)\n" + rag_context)
+            
+        docs: list[dict] = []
+        transcript_docs: list[dict] = []
+        primary: str | None = None
+        conn = self.db_connections[0] if self.db_connections else {}
+        is_video_summary = False
+        is_activity_question = False
 
-            # Detectar si la pregunta es sobre actividades
-            _activity_kw = ["actividad", "actividades", "clase", "clases", "lección", "lecciones", "curso", "cursos"]
-            is_activity_question = any(kw in message.lower() for kw in _activity_kw)
+        if self.db_connections and needs_db:
+            # RAG may suggest a collection, but we rely heavily on heuristics for the content RAG
+            suggested_primary = sources[0].get("collection", "") if sources else ""
 
-            # Forzar transcript_segments si la pregunta es sobre videos
-            _video_kw = ["video", "videos", "grabación", "grabacion",
-                         "transcripción", "transcripcion", "conferencia", "conferencias"]
-            if any(kw in message.lower() for kw in _video_kw):
+            _activity_kw = ["actividad", "actividades", "clase", "clases", "lección", "lecciones"]
+            _module_kw = ["módulo", "modulo", "módulos", "modulos"]
+            _course_kw = ["curso", "cursos", "evento", "eventos", "programa", "diplomado", "certificación", "simposio", "congreso"]
+            _video_kw = ["video", "videos", "grabación", "grabacion", "transcripción", "transcripcion", "conferencia", "conferencias"]
+            _user_kw = ["usuario", "mi", "mis", "progreso", "inscrito"]
+            
+            msg_lower = message.lower()
+            
+            import re
+            def _has_kw(kws: list[str]) -> bool:
+                pattern = r'\b(?:' + '|'.join(kws) + r')\b'
+                return bool(re.search(pattern, msg_lower))
+
+            # 1. Determinar colección principal en base a la intención del usuario
+            if is_personal or _has_kw(_user_kw):
+                primary = "courseattendees"
+            elif _has_kw(_video_kw):
                 primary = "transcript_segments"
-            elif is_activity_question and primary == "activities":
-                # Si pregunta por actividades y RAG detectó activities, buscar también en transcripts
-                pass  # Mantener primary como activities, pero agregar búsqueda en transcripts después
+            elif _has_kw(_activity_kw):
+                primary = "activities"
+            elif _has_kw(_module_kw):
+                primary = "modules"
+            elif _has_kw(_course_kw):
+                primary = "events"
+            else:
+                # Fallback al RAG o a events por defecto
+                primary = suggested_primary or "events"
+
+            is_video_summary = primary == "transcript_segments" and _has_kw(["resumen", "resumir", "resúmen"])
+            is_activity_question = primary in ("activities", "modules")
 
             if primary:
+                # Interceptar consultas dependientes de eventos en GenCampus
+                if self.platform_id == "gencampus" and primary in ("modules", "activities", "courseattendees"):
+                    # Si el usuario menciona "curso" o "evento", buscar primero en events para obtener el ID
+                    _course_kw_dep = ["curso", "evento", "programa", "diplomado", "certificación"]
+                    if _has_kw(_course_kw_dep):
+                        print(f"[chat] resolving event dependency for {primary} based on message")
+                        
+                        # Extraer el nombre del curso de la pregunta usando el extractor de temas genérico
+                        course_topic = await _extract_topic(message, "el nombre del curso o evento")
+                        if course_topic and course_topic.lower() not in _course_kw_dep:
+                            from bson import ObjectId
+                            # Usar fuzzy search en events para ese topic
+                            event_docs = await asyncio.to_thread(
+                                _run_query, conn, "events", 
+                                {"name": {"$regex": course_topic, "$options": "i"}}, 
+                                None, 2
+                            )
+                            if event_docs:
+                                event_ids = [str(d.get("_id", "")) for d in event_docs if d.get("_id")]
+                                if event_ids:
+                                    enriched_message += f" [Encontramos el curso {course_topic}, su event_id/eventId es: {event_ids[0]}]"
+                                    print(f"[chat] resolved event_id={event_ids[0]} for course mention '{course_topic}'")
+
                 collections_list = conn.get("collections")
                 print(f"[chat] loading cache with collections={collections_list}")
                 cached = load_schema_cache(conn["uri"], conn["database"], collections_list)
@@ -300,11 +447,33 @@ class ChatService:
                 if primary == "transcript_segments":
                     docs = await _search_transcripts_async(conn, message)
                 else:
+                    # Intento de generar filtro
                     mongo_filter = await generate_filter_async(enriched_message, primary, schema_fields, enum_values)
                     print(f"[chat] schema_fields={schema_fields} mongo_filter_before={json.dumps(mongo_filter, default=str)}")
+                    
+                    # Si sabemos que estamos buscando un evento en dependencias, forzar o inyectar el event_id en el filtro
+                    if self.platform_id == "gencampus" and primary in ("modules", "activities") and "eventId es:" in enriched_message:
+                        import re as regex
+                        match = regex.search(r"eventId es:\s*([a-fA-F0-9]{24})", enriched_message)
+                        if match:
+                            event_id_val = match.group(1)
+                            # Si no hay filtro, lo creamos
+                            if not mongo_filter:
+                                mongo_filter = {"$or": [{"eventId": event_id_val}, {"event_id": event_id_val}]}
+                            else:
+                                # Limpiamos cualquier búsqueda errónea por nombre/título y priorizamos el evento
+                                mongo_filter.pop("name", None)
+                                mongo_filter.pop("title", None)
+                                if not mongo_filter:
+                                    mongo_filter = {"$or": [{"eventId": event_id_val}, {"event_id": event_id_val}]}
+                                else:
+                                    # Si había más cosas en el filtro, las anidamos con un AND
+                                    mongo_filter = {"$and": [{"$or": [{"eventId": event_id_val}, {"event_id": event_id_val}]}, mongo_filter]}
+                            print(f"[chat] forced event_id filter created from enriched message: {mongo_filter}")
+
                     # Expandir búsquedas de texto a palabras clave individuales
                     mongo_filter = _expand_text_filter_to_keywords(mongo_filter, schema_fields)
-                    print(f"[chat] mongo_filter_after_keyword_expansion={json.dumps(mongo_filter, default=str)}")
+                    print(f"[chat] mongo_filter_after_fuzzy_options={json.dumps(mongo_filter, default=str)}")
                     # Validar que el filtro solo use campos que existen en el schema (solo si tenemos schema)
                     if schema_fields:
                         mongo_filter = _validate_filter_fields(mongo_filter, set(schema_fields))
@@ -324,12 +493,18 @@ class ChatService:
                     sort = [(sort_field, -1)] if is_latest and sort_field else None
                     limit = 1 if is_latest else None
                     print(f"[chat] is_latest={is_latest} sort_field={sort_field} sort={sort} limit={limit}")
+                    # Limitar la respuesta general a un máximo de 5 documentos
                     docs = await asyncio.to_thread(_run_query, conn, primary, mongo_filter, sort, limit)
+                    if docs and limit is None:
+                        docs = docs[:5]
                 print(f"[chat] primary={primary} docs={len(docs)}")
 
                 if docs:
                     if primary == "transcript_segments":
-                        data_parts.append(_transcripts_to_context(docs))
+                        if is_video_summary:
+                            data_parts.append(_transcripts_to_summary_context(docs))
+                        else:
+                            data_parts.append(_transcripts_to_context(docs))
                     else:
                         data_parts.append(docs_to_context(primary, docs, org_id or ""))
                         related = await _fetch_related_async(docs, conn, cached, enriched_message, org_id or "")
@@ -341,42 +516,133 @@ class ChatService:
                     print(f"[chat] activity question detected, also searching transcript_segments")
                     transcript_docs = await _search_transcripts_async(conn, message)
                     if transcript_docs:
+                        transcript_docs = transcript_docs[:5]
                         data_parts.append(_transcripts_to_context(transcript_docs))
                         print(f"[chat] found {len(transcript_docs)} transcript segments related to activities")
 
-        data_context = "\n\n".join(data_parts) if data_parts else "No se encontraron datos relevantes."
-        print(f"[chat] data_context=\n{data_context[:500]}")
+        data_context = "\n\n".join(data_parts) if data_parts else "No se encontraron datos relevantes en la base de datos para esta consulta."
+        print(f"[chat] data_context_len={len(data_context)}")
 
-        if not data_parts:
-            answer_text = (
-                "Lo siento, no encontré información en la base de datos sobre ese curso en este momento. "
-                "Por favor, intenta con otra búsqueda o consulta algo relacionado."
+        # ── Paso 4: invocar LLM ───────────────────────────────────────────────
+        extra_instructions = ""
+        
+        # Preparar las plantillas HTML de las tarjetas para que el LLM inyecte sus resúmenes
+        templates_context = ""
+        if self.platform_id == "gencampus":
+            templates_html = ""
+            if docs and primary in ("events", "activities", "transcript_segments"):
+                templates_html += await _build_gencampus_cards_template_async(conn, docs, primary, org_id or "")
+            if transcript_docs and primary != "transcript_segments":
+                templates_html += await _build_gencampus_cards_template_async(conn, transcript_docs, "transcript_segments", org_id or "")
+            
+            if templates_html:
+                templates_context = f"\n\n## PLANTILLAS DE TARJETAS HTML DISPONIBLES\nEl sistema ha preparado las siguientes tarjetas visuales. PARA CADA VIDEO O CURSO QUE MENCIONES, DEBES imprimir EXACTAMENTE su bloque HTML correspondiente, y reemplazar el texto '{{{{RESUMEN_AQUI}}}}' con tu explicación elaborada. NO uses markdown para las tarjetas, imprime el HTML tal cual.\n\n{templates_html}\n\n"
+
+        if is_video_summary:
+            extra_instructions = (
+                "- Si el usuario pide un resumen de un video específico, usa solo las transcripciones encontradas "
+                "para generar un resumen claro y puntual del contenido del video, e inyéctalo en la tarjeta HTML correspondiente."
             )
-            print(f"[chat] no data fallback answer_text={answer_text}")
-        else:
-            # ── Paso 4: invocar LLM ───────────────────────────────────────────────
-            messages = build_prompt(self.system_prompt, data_context, user_id, user_name, org_id, history)
-            print(f"[chat] prompt_messages={len(messages)}, data_has_content={'No se encontraron' not in data_context}")
-            messages.append({"role": "user", "content": message})
-            answer_text = await _invoke_llm(messages)
-            print(f"[chat] answer_text={answer_text[:200] if answer_text else 'EMPTY'}")
+        elif primary == "transcript_segments" or transcript_docs:
+            extra_instructions = (
+                "- Basándote en los segmentos de transcripción y actividades provistas, genera una respuesta "
+                "elaborada y contextualizada. "
+                "- Para cada video, usa SU TARJETA HTML EXACTA proporcionada arriba, reemplazando {{{{RESUMEN_AQUI}}}} con tu explicación de qué se habla en el video. "
+                "- Dentro de tu explicación, puedes mencionar los tiempos (ej. [00:15:30]) integrados en tu narrativa. "
+                "- NO generes listas repetitivas de tiempos fuera de la tarjeta."
+            )
+        elif templates_context:
+            extra_instructions = (
+                "- Para cada curso o actividad que recomiendes o describas, IMPRIME su bloque HTML completo correspondiente "
+                "proporcionado arriba, reemplazando {{{{RESUMEN_AQUI}}}} con tu descripción o resumen."
+            )
+            
+        # Flujo de evaluación
+        quiz_instructions = (
+            "\n\n## FLUJO DE EVALUACIÓN (QUIZ)\n"
+            "Si el usuario pide ser evaluado, realizar un examen, prueba o quiz, SIGUE ESTE FLUJO ESTRICTAMENTE PASO A PASO:\n"
+            "Paso 1. Revisa los datos de la base de datos en tu contexto (courseattendees, events, etc.) para ver los cursos. "
+            "MUESTRA explícitamente una lista con los nombres de esos cursos y pídele que elija uno para evaluarlo. "
+            "NO le preguntes sobre qué tema general quiere ser evaluado; oblígalo a elegir de la lista.\n"
+            "Paso 2. Espera a que el usuario responda eligiendo un curso.\n"
+            "Paso 3. Una vez elegido el curso, formúlale entre 1 y 3 preguntas sobre el contenido de ese curso. "
+            "Las preguntas pueden ser de opción múltiple o abiertas. Presenta todas las preguntas en un solo mensaje.\n"
+            "Paso 4. Espera a que el usuario responda las preguntas.\n"
+            "Paso 5. Evalúa sus respuestas, dile cuántas acertó y dale una pequeña retroalimentación.\n"
+            "Paso 6. MUY IMPORTANTE: En el mismo mensaje donde le das el resultado final, DEBES incluir AL FINAL de todo tu texto un bloque de código JSON oculto exactamente con este formato (no lo omitas):\n"
+            "```json\n"
+            "{\n"
+            "  \"quiz_result\": {\n"
+            "    \"course_name\": \"Nombre del curso\",\n"
+            "    \"score\": \"1/3\",\n"
+            "    \"questions\": [\"Pregunta 1?\"],\n"
+            "    \"user_answers\": [\"Respuesta 1\"],\n"
+            "    \"feedback\": \"Resumen de su rendimiento\"\n"
+            "  }\n"
+            "}\n"
+            "```"
+        )
+        
+        # Añadir las plantillas y flujos al data_context
+        full_context = data_context + templates_context + quiz_instructions
+
+        messages = build_prompt(
+            self.system_prompt,
+            full_context,
+            user_id,
+            user_name,
+            org_id,
+            history,
+            extra_instructions=extra_instructions,
+        )
+        print(f"[chat] prompt_messages={len(messages)}, data_has_content={'No se encontraron' not in data_context}")
+        messages.append({"role": "user", "content": message})
+        answer_text = await _invoke_llm(messages)
+        print(f"[chat] answer_text={answer_text[:200] if answer_text else 'EMPTY'}")
 
         # ── Paso 5: guardar historial Redis + persistir en MongoDB ───────────
+        
+        # Interceptar resultado de quiz si el LLM emitió el bloque JSON
+        import re
+        quiz_match = re.search(r"```json\s*(\{.*?\"quiz_result\".*?\})\s*```", answer_text, re.DOTALL)
+        if quiz_match:
+            quiz_json_str = quiz_match.group(1)
+            try:
+                import json
+                quiz_data = json.loads(quiz_json_str)
+                # Guardar el quiz de forma asíncrona
+                uri = self.db_connections[0]["uri"] if self.db_connections else settings.meta_mongodb_uri
+                database = self.db_connections[0]["database"] if self.db_connections else settings.meta_mongodb_db
+                asyncio.create_task(_save_quiz_result(uri, database, self.platform_id, user_id, org_id, quiz_data))
+                # Remover el bloque json del texto que verá el usuario
+                answer_text = answer_text[:quiz_match.start()] + answer_text[quiz_match.end():]
+                answer_text = answer_text.strip()
+            except Exception as e:
+                print(f"[chat] error parsing quiz json: {e}")
+
+        # Como las tarjetas ahora las construye e inyecta el propio LLM (o las omitimos de la pre-concatenación),
+        # solo formateamos las fechas
+        answer_text = _format_dates_in_text(answer_text)
+
         history.append({"role": "user", "content": message})
         history.append({"role": "assistant", "content": answer_text})
         collection_used = sources[0].get("collection") if sources else None
-        asyncio.create_task(save_history(self.platform_id, user_id, session_id, history))
-        asyncio.create_task(persist_turn(
-            platform_id=self.platform_id,
-            user_id=user_id,
-            session_id=session_id,
-            user_message=message,
-            assistant_message=answer_text,
-            user_name=user_name,
-            org_id=org_id,
-            collection_used=collection_used,
-            sources=sources,
-        ))
+        
+        # Esperar a que se completen las operaciones de guardado para evitar "Task was destroyed"
+        await asyncio.gather(
+            save_history(self.platform_id, user_id, session_id, history),
+            persist_turn(
+                platform_id=self.platform_id,
+                user_id=user_id,
+                session_id=session_id,
+                user_message=message,
+                assistant_message=answer_text,
+                user_name=user_name,
+                org_id=org_id,
+                collection_used=collection_used,
+                sources=sources,
+            )
+        )
 
         return {
             "answer": answer_text,
@@ -412,17 +678,18 @@ async def _search_transcripts_async(conn: dict, query: str) -> list[dict]:
     )
 
 
-async def _extract_topic(query: str) -> str:
-    """Extrae el tema principal de búsqueda de la pregunta del usuario."""
+async def _extract_topic(query: str, instruction: str = "el tema principal, enfermedad, tratamiento o concepto a buscar en videos") -> str:
+    """Extrae un tema o nombre de la pregunta del usuario."""
     from google import genai
     from google.genai import types
     import warnings
 
     prompt = (
-        f"Extrae el tema o concepto principal que el usuario quiere buscar en videos/clases. "
-        f"Responde SOLO con el término o frase de búsqueda, sin explicaciones.\n\n"
+        f"Extrae EXACTAMENTE {instruction} de la siguiente pregunta. "
+        f"Ignora palabras coloquiales, verbos (explican, dicen), conectores, y no incluyas palabras como 'videos', 'minutos', 'conferencias' o 'clases'. "
+        f"Responde SOLO con el término clave principal (ej: 'hipotiroidismo', 'cáncer de mama').\n\n"
         f"Pregunta: \"{query}\"\n\n"
-        f"Tema de búsqueda:"
+        f"Extracción:"
     )
 
     settings = get_settings()
@@ -436,6 +703,60 @@ async def _extract_topic(query: str) -> str:
         )
     return response.text.strip().strip('"').strip("'")
 
+
+async def _requires_db_query(query: str) -> bool:
+    """
+    Usa el LLM para determinar si la pregunta del usuario requiere buscar 
+    datos en vivo desde la base de datos de la plataforma.
+    """
+    from google import genai
+    from google.genai import types
+    import warnings
+
+    prompt = (
+        "Analiza la siguiente pregunta y determina si el asistente necesita buscar información específica "
+        "en una base de datos educativa (catálogo de cursos, progreso, actividades, usuarios, videos o certificados). "
+        "Responde SOLO 'SI' o 'NO'.\n\n"
+        "Ejemplos que SÍ requieren base de datos:\n"
+        "- ¿Cuál es mi progreso en el curso de endocrinología?\n"
+        "- Busca un video donde mencionen el ayuno intermitente.\n"
+        "- ¿Qué módulos tiene el curso ENDIMET?\n"
+        "- ¿Cuáles cursos hay disponibles sobre la diabetes?\n"
+        "- Quiero que me evalúes o me hagas un examen de mis cursos.\n\n"
+        "Ejemplos que NO requieren base de datos (se responden con conocimiento general o de la documentación):\n"
+        "- Hola, ¿cómo estás?\n"
+        "- Explícame qué es el hipotiroidismo y sus síntomas.\n"
+        "- ¿Para qué sirve la insulina?\n"
+        "- Escríbeme un correo de agradecimiento.\n\n"
+        f"Pregunta: \"{query}\"\n\n"
+        "Respuesta:"
+    )
+
+    settings = get_settings()
+    client = genai.Client(api_key=settings.gemini_api_key)
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
+            response = await client.aio.models.generate_content(
+                model=settings.gemini_model,
+                contents=prompt,
+                config=types.GenerateContentConfig(temperature=0),
+            )
+        ans = response.text.strip().lower()
+        return "si" in ans or "sí" in ans
+    except Exception as e:
+        print(f"[intent] _requires_db_query failed: {e}")
+        return True # Por seguridad, asumir que sí necesita DB si hay error
+
+
+def _format_seconds(seconds: float) -> str:
+    """Format seconds into hh:mm:ss"""
+    if seconds is None:
+        return "00:00:00"
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
 def _transcripts_to_context(activities: list[dict]) -> str:
     if not activities:
         return "No se encontraron videos relacionados con ese tema."
@@ -444,9 +765,252 @@ def _transcripts_to_context(activities: list[dict]) -> str:
         lines.append(f"[{i}] Actividad: {act['name_activity']}")
         lines.append(f"    ID: {act['activity_id']}")
         for seg in act["segments"]:
-            lines.append(f"    [{seg['startTime']}s] {seg['text'].strip()}")
+            time_str = _format_seconds(seg.get('startTime', 0))
+            lines.append(f"    [{time_str}] {seg['text'].strip()}")
         lines.append("")
     return "\n".join(lines)
+
+
+def _transcripts_to_summary_context(activities: list[dict]) -> str:
+    if not activities:
+        return "No se encontraron videos relacionados con ese tema."
+    lines = ["### Transcripciones para resumen de video específico\n"]
+    for i, act in enumerate(activities, 1):
+        lines.append(f"[{i}] Actividad: {act['name_activity']}")
+        for seg in act["segments"]:
+            lines.append(seg["text"].strip())
+        lines.append("")
+    lines.append("Resumen esperado: usa el texto anterior para generar un resumen breve y claro del contenido del video.")
+    return "\n".join(lines)
+
+
+def _format_dates_in_text(text: str) -> str:
+    if not text:
+        return text
+
+    month_names = {
+        1: "ene", 2: "feb", 3: "mar", 4: "abr",
+        5: "may", 6: "jun", 7: "jul", 8: "ago",
+        9: "sep", 10: "oct", 11: "nov", 12: "dic"
+    }
+
+    def _replace_iso_full(match):
+        year, month, day = int(match.group(1)), int(match.group(2)), int(match.group(3))
+        try:
+            # Ignoramos hora y minutos para el texto general
+            # Retorna formato: 28 de mar de 2025
+            dt = datetime(year, month, day)
+            return f"{dt.day} de {month_names[dt.month]} de {dt.year}"
+        except ValueError:
+            return match.group(0)
+
+    def _replace_iso(match):
+        year, month, day = int(match.group(1)), int(match.group(2)), int(match.group(3))
+        try:
+            dt = datetime(year, month, day)
+            return f"{dt.day} de {month_names[dt.month]} de {dt.year}"
+        except ValueError:
+            return match.group(0)
+
+    def _replace_dmy(match):
+        day, month, year = int(match.group(1)), int(match.group(2)), int(match.group(3))
+        try:
+            dt = datetime(year, month, day)
+            return f"{dt.day} de {month_names[dt.month]} de {dt.year}"
+        except ValueError:
+            return match.group(0)
+
+    def _replace_spanish_month(match):
+        day = int(match.group(1))
+        month_name = match.group(2).lower()
+        year = int(match.group(3))
+        month_map = {
+            "enero": 1, "febrero": 2, "marzo": 3, "abril": 4,
+            "mayo": 5, "junio": 6, "julio": 7, "agosto": 8,
+            "septiembre": 9, "octubre": 10, "noviembre": 11, "diciembre": 12,
+        }
+        month = month_map.get(month_name)
+        if not month:
+            return match.group(0)
+        try:
+            dt = datetime(year, month, day)
+            return f"{dt.day} de {month_names[dt.month]} de {dt.year}"
+        except ValueError:
+            return match.group(0)
+
+    # Reemplazar fechas tipo ISO 8601 con T y Z (2025-03-28T16:43:00)
+    text = re.sub(r"\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})T\d{1,2}:\d{1,2}:\d{1,2}(?:\.\d+)?Z?\b", _replace_iso_full, text)
+    # Reemplazar fechas estándar (2025-03-28)
+    text = re.sub(r"\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b", _replace_iso, text)
+    text = re.sub(r"\b(\d{1,2})[-/](\d{1,2})[-/](\d{4})\b", _replace_dmy, text)
+    text = re.sub(
+        r"\b(\d{1,2}) de (enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre) de (\d{4})\b",
+        _replace_spanish_month,
+        text,
+        flags=re.IGNORECASE,
+    )
+    return text
+
+
+def _get_image_from_event_sync(uri: str, database: str, event_id: str) -> str | None:
+    from pymongo import MongoClient
+    from bson import ObjectId
+    try:
+        client = MongoClient(uri, serverSelectionTimeoutMS=5000)
+        db = client[database]
+        
+        # Try to parse as ObjectId or use as string
+        query_id = event_id
+        if len(event_id) == 24 and event_id.isalnum():
+            try:
+                query_id = ObjectId(event_id)
+            except Exception:
+                pass
+                
+        event_doc = db["events"].find_one({"_id": query_id}) or db["events"].find_one({"_id": str(event_id)})
+        if event_doc:
+            if isinstance(event_doc.get("styles"), dict) and event_doc["styles"].get("event_image"):
+                return event_doc["styles"]["event_image"]
+            return event_doc.get("image") or event_doc.get("image_url")
+    except Exception as e:
+        print(f"[card_html] Error fetching event image: {e}")
+    return None
+
+def _get_image_for_activity_sync(uri: str, database: str, activity_id: str) -> str | None:
+    from pymongo import MongoClient
+    from bson import ObjectId
+    try:
+        client = MongoClient(uri, serverSelectionTimeoutMS=5000)
+        db = client[database]
+        
+        query_id = activity_id
+        if len(activity_id) == 24 and activity_id.isalnum():
+            try:
+                query_id = ObjectId(activity_id)
+            except Exception:
+                pass
+                
+        activity_doc = db["activities"].find_one({"_id": query_id}) or db["activities"].find_one({"_id": str(activity_id)})
+        if activity_doc:
+            event_id = activity_doc.get("eventId") or activity_doc.get("event_id")
+            if event_id:
+                return _get_image_from_event_sync(uri, database, event_id)
+    except Exception as e:
+        print(f"[card_html] Error fetching activity related image: {e}")
+    return None
+
+async def _build_gencampus_cards_template_async(conn: dict, docs: list[dict], collection: str, org_id: str) -> str:
+    """Genera plantillas HTML para que el LLM inyecte su propio resumen en {{RESUMEN_AQUI}}."""
+    if not docs or not org_id:
+        return ""
+
+    base_url = settings.gencampus_base_url
+    cards_html = []
+    
+    for doc in docs:
+        image_url = None
+        if isinstance(doc.get("styles"), dict):
+            image_url = doc["styles"].get("event_image")
+        image_url = image_url or doc.get("styles.event_image") or doc.get("image") or doc.get("image_url")
+
+        if not image_url:
+            if collection == "transcript_segments":
+                act_id = doc.get("activity_id")
+                if act_id:
+                    image_url = await asyncio.to_thread(_get_image_for_activity_sync, conn["uri"], conn["database"], str(act_id))
+            elif collection == "activities":
+                evt_id = doc.get("eventId") or doc.get("event_id")
+                if evt_id:
+                    image_url = await asyncio.to_thread(_get_image_from_event_sync, conn["uri"], conn["database"], str(evt_id))
+
+        if collection == "events":
+            title = doc.get("name") or doc.get("title") or "Evento"
+            subtitle = "Evento"
+            url = f"{base_url}/organization/{org_id}/course/{doc.get('_id')}"
+            segments_html = ""
+        elif collection == "transcript_segments":
+            activity_name = doc.get("name_activity") or "Video"
+            title = activity_name
+            subtitle = "Video / Transcripción"
+            
+            segments = doc.get("segments", [])
+            base_activity_url = f"{base_url}/organization/{org_id}/activitydetail/{doc.get('activity_id')}"
+            
+            if segments:
+                import json, urllib.parse
+                first_time = segments[0].get("startTime", 0)
+                fragments_json = urllib.parse.quote(json.dumps(segments))
+                url = f"{base_activity_url}?t={first_time}&fragments={fragments_json}"
+            else:
+                url = base_activity_url
+            
+            segments_list = ""
+            for seg in segments:
+                t = seg.get("startTime", 0)
+                time_str = _format_seconds(t)
+                text = seg.get("text", "").strip()
+                
+                # Make each timestamp a hyperlink to its exact time
+                segment_url = base_activity_url
+                if segments:
+                    segment_url = f"{base_activity_url}?t={t}&fragments={fragments_json}"
+                    
+                segments_list += f"<li style=\"margin-bottom:4px;\"><a href=\"{segment_url}\" target=\"_blank\" rel=\"noopener\" style=\"color:#2563eb;text-decoration:none;\"><strong>[{time_str}]</strong></a> {text}</li>"
+            
+            segments_html = f"<div style=\"margin-top:10px;font-size:13px;color:#374151;background:#f9fafb;padding:8px;border-radius:6px;\"><ul style=\"margin:0;padding-left:20px;\">{segments_list}</ul></div>" if segments_list else ""
+        else:
+            activity_name = doc.get("name") or doc.get("title") or "Actividad"
+            event_name = (
+                doc.get("event_name") or doc.get("course_name") or doc.get("name_event") or doc.get("eventTitle") or doc.get("eventName")
+            )
+            title = activity_name
+            subtitle = f"Evento: {event_name}" if event_name else "Actividad"
+            url = f"{base_url}/organization/{org_id}/activitydetail/{doc.get('_id')}"
+            segments_html = ""
+
+        date_label = ""
+        for key in ("startDate", "datetime_from", "datetime_to", "date", "start_date", "createdAt", "created_at"):
+            if doc.get(key):
+                try:
+                    value = doc.get(key)
+                    if isinstance(value, str):
+                        formatted = _format_dates_in_text(value)
+                    elif isinstance(value, datetime):
+                        month_names = {
+                            1: "ene", 2: "feb", 3: "mar", 4: "abr", 5: "may", 6: "jun",
+                            7: "jul", 8: "ago", 9: "sep", 10: "oct", 11: "nov", 12: "dic"
+                        }
+                        formatted = f"{value.day} de {month_names[value.month]} de {value.year}"
+                    else:
+                        formatted = str(value)
+                    date_label = f"Fecha: {formatted}"
+                    break
+                except Exception:
+                    continue
+
+        image_html = f"<img src=\"{image_url}\" alt=\"Imagen\" style=\"width:100%;height:100%;object-fit:cover;border-radius:12px 0 0 12px;\"/>" if image_url else ""
+        image_container = f"<div style=\"flex: 0 0 200px; max-width: 200px; background:#f1f5f9; border-radius:12px 0 0 12px;\">{image_html}</div>" if image_url else ""
+        date_html = f"<div style=\"color:#555;font-size:0.95rem;margin-top:4px;\">{date_label}</div>" if date_label else ""
+        
+        # El bloque donde el LLM inyectará su resumen dinámico
+        dynamic_summary_html = f"<div style=\"margin-top:10px;font-size:13px;color:#374151;line-height:1.4;\">{{{{RESUMEN_AQUI}}}}</div>"
+        
+        card = (
+            f"<!-- TARJETA HTML PARA: {title} -->\n"
+            f"<div style=\"display:flex;border:1px solid #e2e8f0;border-radius:14px;overflow:hidden;max-width:680px;box-shadow:0 2px 12px rgba(15,23,42,.08);background:#ffffff;margin-bottom:1rem;\">"
+            f"{image_container}"
+            f"<div style=\"flex:1;padding:16px;display:flex;flex-direction:column;justify-content:center;\">"
+            f"<div style=\"font-size:18px;font-weight:700;color:#111827;\">{title}</div>"
+            f"<div style=\"color:#4b5563;font-size:14px;margin-top:6px;\">{subtitle}</div>"
+            f"{date_html}"
+            f"{segments_html}"
+            f"{dynamic_summary_html}"
+            f"<div style=\"margin-top:12px;\"><a href=\"{url}\" target=\"_blank\" rel=\"noopener\" style=\"display:inline-block;padding:8px 14px;background:#2563eb;color:#ffffff;border-radius:8px;text-decoration:none;font-weight:600;font-size:14px;\">Ver en GenCampus</a></div>"
+            f"</div></div>"
+        )
+        cards_html.append(card)
+
+    return "\n\n".join(cards_html)
 
 
 def _run_query(conn: dict, collection: str, mongo_filter: dict, sort: list | None = None, limit: int | None = None) -> list[dict]:
@@ -462,7 +1026,9 @@ def _run_query(conn: dict, collection: str, mongo_filter: dict, sort: list | Non
     try:
         col = ReadOnlyCollection(client[conn["database"]][collection])
         n = limit or MAX_DOCS
-        cursor = col._col.find(mongo_filter, limit=n)
+        # Usar collation para búsquedas fuzzy si hay regex
+        collation = {"locale": "es", "strength": 1} if _has_regex_in_filter(mongo_filter) else None
+        cursor = col._col.find(mongo_filter, limit=n, collation=collation)
         if sort:
             cursor = cursor.sort(sort)
         docs = [_serialize(doc) for doc in cursor]
@@ -475,11 +1041,28 @@ def _run_query(conn: dict, collection: str, mongo_filter: dict, sort: list | Non
         client.close()
 
 
+def _has_regex_in_filter(filter_dict: dict) -> bool:
+    """Verifica si el filtro contiene alguna búsqueda con $regex."""
+    for key, value in filter_dict.items():
+        if key.startswith("$"):
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict) and _has_regex_in_filter(item):
+                        return True
+            elif isinstance(value, dict):
+                if _has_regex_in_filter(value):
+                    return True
+        elif isinstance(value, dict) and "$regex" in value:
+            return True
+    return False
+
+
 def _expand_text_filter_to_keywords(mongo_filter: dict, valid_fields: list[str]) -> dict:
     """
-    Convierte una búsqueda de texto completo en búsqueda por palabras clave individuales.
+    Aplica opciones de búsqueda fuzzy a filtros de texto usando regex de MongoDB.
+    Mantiene la frase completa en lugar de expandir a palabras clave individuales.
     Ej: {"description": {"$regex": "cancer de mama"}} 
-    -> {"$or": [{"description": {"$regex": "cancer"}}, {"description": {"$regex": "mama"}}]}
+    -> {"description": {"$regex": "cancer de mama", "$options": "i"}}
     """
     if not isinstance(mongo_filter, dict):
         return mongo_filter
@@ -495,22 +1078,15 @@ def _expand_text_filter_to_keywords(mongo_filter: dict, valid_fields: list[str])
             else:
                 result[key] = value
         elif isinstance(value, dict) and "$regex" in value:
-            # Campo con búsqueda de regex - expandir a palabras clave
+            # Campo con búsqueda de regex - aplicar opciones fuzzy
             regex_pattern = value["$regex"]
             options = value.get("$options", "")
             
-            # Extraer palabras clave (palabras de 4+ caracteres, excluyendo stopwords)
-            keywords = _extract_search_keywords(regex_pattern)
+            # Agregar case-insensitive si no está presente
+            if "i" not in options:
+                options += "i"
             
-            if len(keywords) > 1:
-                # Múltiples palabras: buscar cada una en el campo actual
-                or_conditions = []
-                for keyword in keywords:
-                    or_conditions.append({key: {"$regex": keyword, "$options": options}})
-                result["$or"] = or_conditions
-            else:
-                # Una sola palabra o frase corta: mantener como está
-                result[key] = value
+            result[key] = {"$regex": regex_pattern, "$options": options}
         else:
             result[key] = value
     
@@ -642,20 +1218,30 @@ def _extract_search_keywords(text: str) -> list[str]:
 
 def _expand_events_text_filter_for_gencampus(mongo_filter: dict) -> dict:
     """
-    Para GenCampus: si events viene filtrado por `description` con regex,
+    Para GenCampus: si events viene filtrado por `description`, `category` o `title` con regex,
     ampliar a búsqueda en `description` o `name`.
     """
     if not isinstance(mongo_filter, dict):
         return mongo_filter
 
-    description_filter = mongo_filter.get("description")
-    if not (isinstance(description_filter, dict) and "$regex" in description_filter):
+    text_regex = None
+    target_field = None
+    
+    for field in ("description", "category", "title", "name"):
+        val = mongo_filter.get(field)
+        if isinstance(val, dict) and "$regex" in val:
+            text_regex = val
+            target_field = field
+            break
+
+    if not text_regex or not target_field:
         return mongo_filter
 
-    remaining = {k: v for k, v in mongo_filter.items() if k != "description"}
+    remaining = {k: v for k, v in mongo_filter.items() if k != target_field}
     or_clause = [
-        {"description": description_filter},
-        {"name": description_filter},
+        {"name": text_regex},
+        {"description": text_regex},
+        {"category": text_regex}
     ]
 
     existing_or = remaining.pop("$or", None)

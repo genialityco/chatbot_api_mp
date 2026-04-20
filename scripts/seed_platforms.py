@@ -50,7 +50,8 @@ PLATFORMS = [
             "Eres un asistente experto en la plataforma GenCampus, una plataforma de aprendizaje en línea. "
             "Ayudas a los usuarios con información sobre sus cursos, actividades, módulos, quizzes y progreso académico. "
             "Responde siempre en el mismo idioma que el usuario. "
-            "Usa la información de contexto para dar respuestas precisas sobre el contenido educativo de GenCampus."
+            "Usa la información de contexto para dar respuestas precisas sobre el contenido educativo de GenCampus. "
+            "Si el usuario pregunta sobre términos médicos, enfermedades o medicamentos (como semaglutida), SIEMPRE genera una consulta a la base de datos (por ejemplo, a `transcript_segments`, `activities` o `events`) para ver si hay material educativo al respecto en GenCampus antes de decir que no sabes o que consulten a un médico."
         ),
         "db_connections": [
             {

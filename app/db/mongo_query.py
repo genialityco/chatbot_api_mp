@@ -133,6 +133,22 @@ def _prepare_filter(raw: dict) -> dict:
     return {k: _cast_filter(v, k) for k, v in raw.items()}
 
 
+def _has_regex_in_filter(filter_dict: dict) -> bool:
+    """Verifica si el filtro contiene alguna búsqueda con $regex."""
+    for key, value in filter_dict.items():
+        if key.startswith("$"):
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict) and _has_regex_in_filter(item):
+                        return True
+            elif isinstance(value, dict):
+                if _has_regex_in_filter(value):
+                    return True
+        elif isinstance(value, dict) and "$regex" in value:
+            return True
+    return False
+
+
 # ─── Generación de filtro con LLM ────────────────────────────────────────────
 
 _FILTER_PROMPT = """Eres un experto en MongoDB. Tu tarea es generar un filtro de consulta MongoDB en JSON.
@@ -158,6 +174,7 @@ RESTRICCIONES CRÍTICAS:
 - Si el campo es user_id (con guión bajo), usa "user_id" — NO "userId".
 - Si el campo es event_id, usa "event_id" — NO "eventId".
 - Usa operadores como $gte, $lte, $in, $regex cuando sea necesario.
+- IMPORTANTE: Para buscar cursos, eventos, temas o categorías, asume que están contenidos en el campo `name` o `description`. Realiza SIEMPRE una búsqueda fuzzy (ej: `{{"name": {{"$regex": "<término>", "$options": "i"}}}}`). NUNCA inventes campos como `category` si no están en "Campos disponibles".
 - Para fechas usa formato ISO 8601.
 - Los campos que terminan en "Id" (camelCase) son ObjectId — usa el string hex de 24 chars.
 - Los campos con guión bajo como user_id, event_id son strings — NO los conviertas a ObjectId.
@@ -177,6 +194,22 @@ Ejemplos:
 """
 
 
+def _get_default_fields(collection: str) -> list[str]:
+    """Devuelve campos reales de GenCampus como fallback si no hay esquema en cache."""
+    if collection == "events":
+        return ["name", "description", "datetime_from", "datetime_to", "type_event", "visibility", "allow_register"]
+    elif collection == "activities":
+        return ["name", "description", "short_description", "type_id", "module_id", "event_id", "is_info_only"]
+    elif collection == "courseattendees":
+        return ["user_id", "event_id", "status", "progress", "createdAt", "updatedAt"]
+    elif collection == "modules":
+        return ["module_name", "order", "event_id", "progress"]
+    elif collection == "transcript_segments":
+        return ["activity_id", "name_activity", "text", "startTime", "endTime"]
+    elif collection == "users":
+        return ["_id", "names", "email", "uid"]
+    return ["name", "description", "createdAt", "updatedAt"]
+
 def _generate_filter_with_llm(question: str, collection: str, fields: list[str]) -> dict:
     """Usa el LLM configurado para generar el filtro MongoDB (síncrono)."""
     from app.services.chat_service import get_llm
@@ -185,19 +218,7 @@ def _generate_filter_with_llm(question: str, collection: str, fields: list[str])
 
     # Si no hay campos del schema, usar campos comunes por colección
     if not fields:
-        if collection == "events":
-            fields = ["name", "description", "startDate", "endDate", "location", "category", "tags"]
-        elif collection == "activities":
-            fields = ["name", "description", "content", "type", "duration", "order"]
-        elif collection == "courseattendees":
-            fields = ["user_id", "event_id", "status", "progress", "enrolledAt", "completedAt"]
-        elif collection == "transcript_segments":
-            fields = ["video_id", "text", "start_time", "end_time", "speaker"]
-        elif collection == "users":
-            fields = ["_id", "name", "email", "role", "organizationId"]
-        else:
-            # Campos genéricos para cualquier colección
-            fields = ["name", "title", "description", "text", "content", "status", "createdAt", "updatedAt"]
+        fields = _get_default_fields(collection)
 
     prompt = _FILTER_PROMPT.format(
         now=now.isoformat(),
@@ -227,19 +248,7 @@ async def generate_filter_async(question: str, collection: str, fields: list[str
 
     # Si no hay campos del schema, usar campos comunes por colección
     if not fields:
-        if collection == "events":
-            fields = ["name", "description", "startDate", "endDate", "location", "category", "tags"]
-        elif collection == "activities":
-            fields = ["name", "description", "content", "type", "duration", "order"]
-        elif collection == "courseattendees":
-            fields = ["user_id", "event_id", "status", "progress", "enrolledAt", "completedAt"]
-        elif collection == "transcript_segments":
-            fields = ["video_id", "text", "start_time", "end_time", "speaker"]
-        elif collection == "users":
-            fields = ["_id", "name", "email", "role", "organizationId"]
-        else:
-            # Campos genéricos para cualquier colección
-            fields = ["name", "title", "description", "text", "content", "status", "createdAt", "updatedAt"]
+        fields = _get_default_fields(collection)
 
     # Construir descripción de campos con valores enum si existen
     fields_desc = []
@@ -333,7 +342,9 @@ def fetch_collection_data(
         return []
 
     try:
-        cursor = col._col.find(mongo_filter, limit=MAX_DOCS)
+        # Usar collation para búsquedas fuzzy (case y diacríticos insensitive) si hay regex
+        collation = {"locale": "es", "strength": 1} if _has_regex_in_filter(mongo_filter) else None
+        cursor = col._col.find(mongo_filter, limit=MAX_DOCS, collation=collation)
         docs = [_serialize(doc) for doc in cursor]
         print(f"[mongo_query] docs_found={len(docs)}")
     except Exception as e:
@@ -385,12 +396,43 @@ def search_transcript_segments(
     client = MongoClient(uri, serverSelectionTimeoutMS=8000)
     try:
         col = client[database]["transcript_segments"]
-        # Buscar segmentos que mencionen el tema
-        cursor = col.find(
-            {"text": {"$regex": topic, "$options": "i"}},
-            {"text": 1, "activity_id": 1, "name_activity": 1, "startTime": 1},
+        
+        # Tokenizar el topic para buscar todas sus palabras clave en el mismo segmento
+        # Filtramos stopwords para no requerir que palabras de conectores sean coincidentes
+        stopwords = {
+            "de", "la", "el", "los", "las", "un", "una", "unos", "unas", "y", "o", "en", "para", "por", "con", "sobre", "del", "al",
+            "qué", "que", "como", "cómo", "cuando", "cuándo", "donde", "dónde", "quién", "quien", "cuales", "cuáles", "cual", "cuál",
+            "explican", "explica", "hablan", "habla", "dicen", "dice", "mencionan", "menciona", "minutos", "minuto", "exactos", "exacto",
+            "videos", "video", "conferencias", "conferencia", "curso", "cursos", "clases", "clase", "lecciones", "lección", "leccion"
+        }
+        words = re.findall(r'\b[a-zA-ZáéíóúÁÉÍÓÚñÑ0-9]{3,}\b', topic.lower())
+        keywords = [w for w in words if w not in stopwords]
+        
+        if not keywords:
+            keywords = [topic]
+
+        # 1. Primer intento: $and (Alta precisión, todas las palabras en el mismo segmento)
+        if len(keywords) > 1:
+            query_filter = {"$and": [{"text": {"$regex": kw, "$options": "i"}} for kw in keywords]}
+        else:
+            query_filter = {"text": {"$regex": keywords[0], "$options": "i"}}
+
+        cursor = list(col.find(
+            query_filter,
+            {"_id": 1, "text": 1, "activity_id": 1, "name_activity": 1, "startTime": 1, "endTime": 1},
             limit=200,
-        )
+            collation={"locale": "es", "strength": 1}
+        ))
+        
+        # 2. Segundo intento (Fallback): $or (Alta recuperación, al menos una palabra en el segmento)
+        if not cursor and len(keywords) > 1:
+            query_filter = {"$or": [{"text": {"$regex": kw, "$options": "i"}} for kw in keywords]}
+            cursor = list(col.find(
+                query_filter,
+                {"_id": 1, "text": 1, "activity_id": 1, "name_activity": 1, "startTime": 1, "endTime": 1},
+                limit=200,
+                collation={"locale": "es", "strength": 1}
+            ))
 
         # Agrupar por actividad
         activities: dict[str, dict] = {}
@@ -405,8 +447,11 @@ def search_transcript_segments(
                 }
             if len(activities[aid]["segments"]) < segments_per_activity:
                 activities[aid]["segments"].append({
+                    "segmentId": str(doc.get("_id", "")),
                     "text": doc.get("text", ""),
-                    "startTime": doc.get("startTime"),
+                    "startTime": doc.get("startTime", 0),
+                    "endTime": doc.get("endTime", 0),
+                    "score": 100.0,  # Placeholder for frontend compatibility
                 })
 
         # Devolver las primeras N actividades
