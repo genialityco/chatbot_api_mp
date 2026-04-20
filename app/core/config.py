@@ -8,6 +8,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
+        extra="ignore",
     )
 
     # App
@@ -15,6 +16,7 @@ class Settings(BaseSettings):
     app_env: Literal["development", "staging", "production"] = "development"
     debug: bool = False
     secret_key: str = "changeme"
+    meta_verify_token: str = "geniality_verify_token"
 
     # LLM
     llm_provider: Literal["openai", "anthropic", "gemini"] = "gemini"
@@ -58,6 +60,10 @@ class Settings(BaseSettings):
         "events", "activities", "courseattendees", "transcript_segments", "modules", "organizations",
         "organizationusers", "quizzes", "UserAttemptsQuiz", "users", "host",
     ]
+
+    # WhatsApp Cloud API
+    whatsapp_token: str = ""
+    whatsapp_phone_id: str = ""
 
     # Platform DB connections (para seed)
     acho_mongo_uri: str = ""

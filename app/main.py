@@ -11,7 +11,7 @@ from beanie import init_beanie
 from app.core.config import get_settings
 from app.models.platform import Platform
 from app.models.conversation import ChatTurn
-from app.api import chat, platforms, recommendations
+from app.api import chat, platforms, recommendations, webhook
 from app.api import widget
 
 settings = get_settings()
@@ -52,6 +52,7 @@ app.include_router(chat.router)
 app.include_router(platforms.router)
 app.include_router(recommendations.router)
 app.include_router(widget.router)
+app.include_router(webhook.router)
 
 
 @app.get("/health")
