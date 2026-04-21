@@ -600,6 +600,7 @@ class ChatService:
         # ── Paso 5: guardar historial Redis + persistir en MongoDB ───────────
         
         # Interceptar resultado de quiz si el LLM emitió el bloque JSON
+        quiz_save_coro = None
         quiz_match = re.search(r"```json\s*(\{.*?\"quiz_result\".*?\})\s*```", answer_text, re.DOTALL)
         if quiz_match:
             quiz_json_str = quiz_match.group(1)

@@ -1,5 +1,7 @@
 from fastapi import APIRouter, BackgroundTasks, Query, HTTPException, Request
 
+from motor.motor_asyncio import AsyncIOMotorClient
+
 from app.core.config import get_settings
 from app.services.whatsapp_service import markdown_to_whatsapp, send_text_message
 
@@ -60,6 +62,46 @@ async def _process_and_reply(phone: str, message: str) -> None:
             print(f"[webhook] platform '{_WA_PLATFORM_ID}' not found")
             return
 
+        # ─── Búsqueda de usuario por teléfono ─────────────────────────
+        # En Meta, el teléfono viene ej: "573104365063" (con código país, sin +)
+        # En la BD puede estar como: "573104365063", "+573104365063", "3104365063", o float(3104365063.0)
+        possible_phones = [phone, f"+{phone}"]
+        if len(phone) >= 10:
+            last_10 = phone[-10:]
+            possible_phones.append(last_10)
+            try:
+                possible_phones.append(float(last_10))
+            except ValueError:
+                pass
+                
+        user_id_str = phone  # Por defecto si no lo encontramos
+        user_name = None
+        
+        # Obtener conexión de DB
+        gencampus_conn = next((c for c in platform.db_connections if c.database == settings.gencampus_mongo_db), None)
+        
+        if gencampus_conn:
+            client = AsyncIOMotorClient(gencampus_conn.uri)
+            db = client[gencampus_conn.database]
+            
+            org_user = await db.organizationusers.find_one({
+                'properties.phone': {'$in': possible_phones}
+            })
+            
+            if org_user and 'user_id' in org_user:
+                user_id_str = str(org_user['user_id'])
+                # Opcional: Buscar nombre del usuario si queremos usarlo luego
+                if 'properties' in org_user:
+                    user_name = f"{org_user['properties'].get('names', '')} {org_user['properties'].get('lastNames', '')}".strip()
+            else:
+                # No autorizado
+                await send_text_message(phone, "Lo siento, no estás autorizado para usar este canal ya que tu número no está registrado en la plataforma.")
+                client.close()
+                return
+                
+            client.close()
+        # ──────────────────────────────────────────────────────────────
+
         service = ChatService(
             platform_id=_WA_PLATFORM_ID,
             org_id=None,
@@ -69,7 +111,8 @@ async def _process_and_reply(phone: str, message: str) -> None:
 
         result = await service.chat(
             message=message,
-            user_id=phone,
+            user_id=user_id_str,
+            user_name=user_name,
             session_id=f"wa_{phone}",
         )
 
