@@ -3,6 +3,7 @@ from app.core.auth import get_platform_context
 from app.models.platform import ChatRequest, ChatResponse
 from app.models.recommendation import RecommendationRequest, RecommendationResponse
 from app.services.chat_service import ChatService
+from app.services.socratic_agent import SocraticAgent
 from app.services.history_service import clear_history, get_user_history, get_platform_history
 from app.services.recommendation_service import RecommendationService
 
@@ -26,13 +27,22 @@ async def chat(
     org_id = ctx["org_id"]
 
     system_prompt = platform.get_system_prompt(org_id)
+    db_connections = [c.model_dump() for c in platform.db_connections]
 
-    service = ChatService(
-        platform_id=ctx["platform_id"],
-        org_id=org_id,
-        system_prompt=system_prompt,
-        db_connections=[c.model_dump() for c in platform.db_connections],
-    )
+    if getattr(platform, "socratic_mode", False):
+        service = SocraticAgent(
+            platform_id=ctx["platform_id"],
+            org_id=org_id,
+            base_prompt=system_prompt,
+            db_connections=db_connections,
+        )
+    else:
+        service = ChatService(
+            platform_id=ctx["platform_id"],
+            org_id=org_id,
+            system_prompt=system_prompt,
+            db_connections=db_connections,
+        )
 
     try:
         result = await service.chat(
