@@ -29,6 +29,8 @@ async def lifespan(app: FastAPI):
     yield
     # Shutdown
     client.close()
+    from app.db.mongo_pool import close_all
+    close_all()
 
 
 app = FastAPI(

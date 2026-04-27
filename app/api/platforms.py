@@ -263,7 +263,64 @@ async def index_status(
     )
 
 
-@router.post("/{platform_id}/regenerate-key")
+@router.post("/{platform_id}/index/content")
+async def trigger_content_index(
+    platform_id: str,
+    background_tasks: BackgroundTasks,
+    org_id: str | None = None,
+    event_id: str | None = None,
+    _: None = Depends(require_admin),
+):
+    """
+    Indexa el contenido real de cursos en el RAG.
+    - Sin event_id: re-indexa todos los cursos (force=True, borra y recrea).
+    - Con event_id: indexa solo ese curso de forma incremental (no toca el resto).
+    """
+    from app.rag.content_indexer import build_content_rag, build_single_course_rag
+
+    platform = await Platform.find_one(Platform.platform_id == platform_id)
+    if not platform:
+        raise HTTPException(404, "Plataforma no encontrada.")
+    if not platform.db_connections:
+        raise HTTPException(400, "La plataforma no tiene conexiones de base de datos configuradas.")
+
+    key = _status_key(platform_id, org_id) + (f":{event_id}" if event_id else ":content")
+    if _index_status.get(key, {}).get("status") == "indexing":
+        return {"message": "Indexación ya en curso.", "status": "indexing"}
+
+    _index_status[key] = {"status": "indexing", "message": "Indexando..."}
+
+    async def _run():
+        try:
+            conn = platform.db_connections[0]
+            if event_id:
+                result = await build_single_course_rag(conn.uri, conn.database, platform_id, event_id, org_id)
+            else:
+                result = await build_content_rag(conn.uri, conn.database, platform_id, org_id)
+            _index_status[key] = {**result, "status": "ready"}
+        except Exception as e:
+            _index_status[key] = {"status": "error", "message": str(e)}
+            print(f"[content_index] error: {e}")
+
+    background_tasks.add_task(_run)
+    return {
+        "message": "Indexación iniciada.",
+        "platform_id": platform_id,
+        "org_id": org_id,
+        "event_id": event_id,
+        "mode": "incremental" if event_id else "full",
+        "status": "indexing",
+    }
+
+
+@router.get("/{platform_id}/index/content/status")
+async def content_index_status(
+    platform_id: str,
+    org_id: str | None = None,
+    _: None = Depends(require_admin),
+):
+    key = _status_key(platform_id, org_id) + ":content"
+    return _index_status.get(key, {"status": "not_started"})
 async def regenerate_api_key(
     platform_id: str,
     _: None = Depends(require_admin),
