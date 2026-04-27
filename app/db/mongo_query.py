@@ -17,6 +17,7 @@ from pymongo import MongoClient, ASCENDING, DESCENDING
 from pymongo.collection import Collection
 
 from app.core.config import get_settings
+from app.db.mongo_pool import get_db
 
 settings = get_settings()
 
@@ -315,8 +316,7 @@ def fetch_collection_data(
     if collection not in allowed:
         raise PermissionError(f"Colección '{collection}' no permitida.")
 
-    client = MongoClient(uri, serverSelectionTimeoutMS=8000)
-    db = client[database]
+    db = get_db(uri, database)
     col = ReadOnlyCollection(db[collection])
 
     mongo_filter: dict = {}
@@ -393,9 +393,8 @@ def search_transcript_segments(
     Busca segmentos de transcripción que contengan el tema indicado.
     Agrupa por activity_id y devuelve los videos más relevantes con fragmentos de contexto.
     """
-    client = MongoClient(uri, serverSelectionTimeoutMS=8000)
+    col = get_db(uri, database)["transcript_segments"]
     try:
-        col = client[database]["transcript_segments"]
         
         # Tokenizar el topic para buscar todas sus palabras clave en el mismo segmento
         # Filtramos stopwords para no requerir que palabras de conectores sean coincidentes
@@ -461,5 +460,3 @@ def search_transcript_segments(
     except Exception as e:
         print(f"[transcript] search error: {e}")
         return []
-    finally:
-        client.close()

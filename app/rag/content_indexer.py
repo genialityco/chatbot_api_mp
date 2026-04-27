@@ -61,40 +61,46 @@ async def build_content_rag(uri: str, database: str, platform_id: str, org_id: s
     
     # Agregar módulos
     for mod in modules:
-        eid = str(mod.get("eventId") or mod.get("event_id"))
+        eid = str(mod.get("eventId") or mod.get("event_id") or "")
         mid = str(mod.get("_id"))
-        if eid in courses_data:
+        if eid and eid in courses_data:
             courses_data[eid]["modules"][mid] = {
                 "name": mod.get("name", mod.get("title", "Módulo sin nombre")),
                 "activities": []
             }
-            
+
     # Agregar actividades y fragmentos
     for act in activities:
-        eid = str(act.get("eventId") or act.get("event_id"))
-        mid = str(act.get("moduleId") or act.get("module_id"))
-        
-        # En caso de que la actividad no tenga moduleId pero sí eventId, crear un módulo genérico
-        if not mid and eid in courses_data:
+        eid = str(act.get("eventId") or act.get("event_id") or "")
+        raw_mid = act.get("moduleId") or act.get("module_id")
+        mid = str(raw_mid) if raw_mid else None
+
+        if not eid or eid not in courses_data:
+            continue
+
+        # Si la actividad no tiene módulo, usar un contenedor genérico directo al curso
+        if not mid or mid not in courses_data[eid]["modules"]:
             mid = "unassigned"
             if mid not in courses_data[eid]["modules"]:
-                courses_data[eid]["modules"][mid] = {"name": "Módulo General", "activities": []}
-                
-        if eid in courses_data and mid in courses_data[eid]["modules"]:
-            aid = str(act.get("_id"))
-            act_name = act.get("name", act.get("title", "Actividad"))
-            
-            # Buscar transcripciones de esta actividad
-            act_transcripts = [t.get("text", "") for t in transcripts if str(t.get("activity_id")) == aid]
-            transcripts_text = " ".join(act_transcripts)
-            if len(transcripts_text) > 2000:
-                transcripts_text = transcripts_text[:1997] + "..." # Limitar para no explotar tokens en resumen
-                
-            courses_data[eid]["modules"][mid]["activities"].append({
-                "name": act_name,
-                "content": act.get("description", act.get("content", "")),
-                "transcripts": transcripts_text
-            })
+                courses_data[eid]["modules"][mid] = {"name": "Actividades", "activities": []}
+
+        aid = str(act.get("_id"))
+        act_name = act.get("name", act.get("title", "Actividad"))
+
+        # Buscar transcripciones de esta actividad (activity_id puede ser string o ObjectId)
+        act_transcripts = [
+            t.get("text", "") for t in transcripts
+            if str(t.get("activity_id")) == aid
+        ]
+        transcripts_text = " ".join(act_transcripts)
+        if len(transcripts_text) > 2000:
+            transcripts_text = transcripts_text[:1997] + "..."
+
+        courses_data[eid]["modules"][mid]["activities"].append({
+            "name": act_name,
+            "content": act.get("description", act.get("content", "")),
+            "transcripts": transcripts_text
+        })
 
     client.close()
 
@@ -117,24 +123,28 @@ async def build_content_rag(uri: str, database: str, platform_id: str, org_id: s
         
         if modules_lines:
             try:
-                # 1. Resumen con IA
                 summary = await _summarize_course_content(course_name, modules_lines)
-                
-                # 2. Agregar al documento principal del curso
                 content_to_index = f"CURSO: {course_name}\nDESCRIPCIÓN: {cdata['description']}\n\nRESUMEN GLOBAL:\n{summary}\n\nESTRUCTURA DE MÓDULOS Y ACTIVIDADES:\n" + "\n".join(modules_lines)
-                
-                doc = Document(
-                    page_content=content_to_index,
-                    metadata={
-                        "doc_type": "course_summary",
-                        "collection": "events",
-                        "event_id": eid,
-                        "name": course_name
-                    }
-                )
-                documents.append(doc)
             except Exception as e:
                 print(f"[content_indexer] Error resumiendo {course_name}: {e}")
+                content_to_index = f"CURSO: {course_name}\nDESCRIPCIÓN: {cdata['description']}\n\n" + "\n".join(modules_lines)
+        else:
+            # Curso sin actividades — indexar solo con nombre y descripción
+            print(f"[content_indexer] Curso sin actividades: {course_name}, indexando solo descripción")
+            content_to_index = f"CURSO: {course_name}\nDESCRIPCIÓN: {cdata['description']}"
+            if not cdata['description']:
+                continue  # nada útil que indexar
+
+        doc = Document(
+            page_content=content_to_index,
+            metadata={
+                "doc_type": "course_summary",
+                "collection": "events",
+                "event_id": eid,
+                "name": course_name
+            }
+        )
+        documents.append(doc)
 
     # Dividir y empaquetar los documentos grandes usando _prepare_documents para evitar el error de límite de embeddings
     if documents:
@@ -157,6 +167,66 @@ async def build_content_rag(uri: str, database: str, platform_id: str, org_id: s
         "status": "ready",
         "documents_indexed": len(documents)
     }
+
+async def build_single_course_rag(
+    uri: str, database: str, platform_id: str, event_id: str, org_id: str | None = None
+) -> dict[str, Any]:
+    """Indexa un solo curso de forma incremental sin tocar el resto del índice."""
+    from bson import ObjectId
+    client = MongoClient(uri, serverSelectionTimeoutMS=8000)
+    db = client[database]
+
+    # Buscar el evento
+    try:
+        eid_query = ObjectId(event_id)
+    except Exception:
+        eid_query = event_id
+    event = db["events"].find_one({"_id": eid_query})
+    if not event:
+        client.close()
+        return {"status": "error", "message": f"Evento {event_id} no encontrado."}
+
+    eid_str = str(event["_id"])
+    course_name = event.get("name", event.get("title", "Curso sin nombre"))
+
+    # Actividades del curso
+    activities = list(db["activities"].find(
+        {"$or": [{"event_id": eid_str}, {"eventId": eid_str}]}
+    ))
+    transcripts = list(db["transcript_segments"].find({})) if activities else []
+
+    modules_lines = []
+    for act in activities:
+        aid = str(act.get("_id"))
+        act_name = act.get("name", act.get("title", "Actividad"))
+        act_transcripts = [t.get("text", "") for t in transcripts if str(t.get("activity_id")) == aid]
+        transcripts_text = " ".join(act_transcripts)[:2000]
+        modules_lines.append(f" - Actividad: {act_name}")
+        if transcripts_text:
+            modules_lines.append(f"   (Habla sobre: {transcripts_text})")
+
+    client.close()
+
+    if modules_lines:
+        try:
+            summary = await _summarize_course_content(course_name, modules_lines)
+            content = f"CURSO: {course_name}\nDESCRIPCIÓN: {event.get('description', '')}\n\nRESUMEN GLOBAL:\n{summary}\n\nESTRUCTURA:\n" + "\n".join(modules_lines)
+        except Exception as e:
+            content = f"CURSO: {course_name}\nDESCRIPCIÓN: {event.get('description', '')}\n\n" + "\n".join(modules_lines)
+    else:
+        content = f"CURSO: {course_name}\nDESCRIPCIÓN: {event.get('description', '')}"
+
+    from app.rag.pipeline import _prepare_documents
+    raw = [{"text": content, "doc_type": "course_summary", "collection": "events", "event_id": eid_str, "name": course_name}]
+    docs = _prepare_documents(raw)
+
+    embeddings = get_embeddings()
+    # force=False → incremental, no borra el índice existente
+    _build_vector_store(docs, embeddings, platform_id, org_id, force=False)
+    print(f"[content_indexer] incremental: {len(docs)} chunks added for '{course_name}'")
+
+    return {"status": "ready", "documents_indexed": len(docs), "course": course_name}
+
 
 if __name__ == "__main__":
     from app.core.config import get_settings

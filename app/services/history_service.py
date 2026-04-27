@@ -129,6 +129,59 @@ async def persist_turn(
         print(f"[history] mongo persist error: {e}")
 
 
+async def compress_history_for_prompt(history: list[dict]) -> tuple[str, list[dict]]:
+    """
+    Divide el historial en dos partes para el prompt:
+    - summary: resumen comprimido de los turnos más antiguos (si los hay)
+    - recent: los últimos N turnos completos para contexto inmediato
+
+    Retorna (summary_text, recent_messages).
+    """
+    window = settings.history_window_turns * 2   # cada turno = 2 mensajes (user + assistant)
+    summary_limit = settings.history_summary_turns * 2
+
+    if len(history) <= window:
+        return "", history
+
+    older = history[-(window + summary_limit):-window]
+    recent = history[-window:]
+
+    if not older:
+        return "", recent
+
+    # Comprimir los turnos antiguos con el LLM
+    summary_text = await _summarize_old_turns(older)
+    return summary_text, recent
+
+
+async def _summarize_old_turns(messages: list[dict]) -> str:
+    """Genera un resumen conciso de turnos de conversación anteriores."""
+    from app.services.chat_service import _invoke_llm
+
+    turns_text = ""
+    for msg in messages:
+        role = "Usuario" if msg.get("role") == "user" else "Asistente"
+        turns_text += f"{role}: {msg.get('content', '')}\n"
+
+    prompt_messages = [
+        {
+            "role": "system",
+            "content": (
+                "Resume en 3-5 oraciones los puntos clave de esta conversación anterior. "
+                "Incluye: temas tratados, cursos mencionados, preferencias del usuario y cualquier "
+                "acuerdo o conclusión relevante. Sé conciso y factual."
+            ),
+        },
+        {"role": "user", "content": turns_text},
+    ]
+    try:
+        summary = await _invoke_llm(prompt_messages, temperature=0.1)
+        return f"[Resumen de conversación anterior]: {summary}"
+    except Exception as e:
+        print(f"[history] summary error: {e}")
+        return ""
+
+
 async def get_user_history(
     platform_id: str,
     user_id: str,
