@@ -48,6 +48,10 @@ class Settings(BaseSettings):
     rag_top_k: int = 5
     rag_score_threshold: float = 0.35
 
+    # Historial en prompt
+    history_window_turns: int = 6        # Turnos recientes que se incluyen completos en el prompt
+    history_summary_turns: int = 14      # Turnos anteriores que se comprimen en un resumen
+
     # Schema introspection
     schema_sample_docs: int = 5
     schema_max_depth: int = 3

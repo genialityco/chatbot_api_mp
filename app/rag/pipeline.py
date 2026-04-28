@@ -117,7 +117,6 @@ def _build_vector_store(
         os.makedirs(persist_dir, exist_ok=True)
         collection_name = _namespace(platform_id, org_id)
 
-        # Si force, borrar la colección existente antes de recrear
         if force and os.path.exists(persist_dir):
             import chromadb
             client = chromadb.PersistentClient(path=persist_dir)
@@ -125,6 +124,13 @@ def _build_vector_store(
                 client.delete_collection(collection_name)
             except Exception:
                 pass
+
+        # Si ya existe la colección y no es force, agregar incrementalmente
+        existing = _load_vector_store(embeddings, platform_id, org_id)
+        if existing and not force:
+            existing.add_documents(documents)
+            print(f"[rag] incremental add: {len(documents)} docs to existing index")
+            return existing
 
         vs = Chroma.from_documents(
             documents=documents,
@@ -134,7 +140,7 @@ def _build_vector_store(
         )
         return vs
 
-    # FAISS
+    # FAISS — no soporta incremental nativo, siempre reconstruye
     vs = FAISS.from_documents(documents=documents, embedding=embeddings)
     faiss_dir = os.path.join("./data/faiss", _namespace(platform_id, org_id))
     os.makedirs(faiss_dir, exist_ok=True)
@@ -275,6 +281,8 @@ class RAGRetriever:
     def retrieve_as_context(self, query: str) -> tuple[str, list[dict]]:
         """
         Devuelve (context_text, sources) para inyectar en el prompt.
+        Incluye metadata de jerarquía (curso → módulo → actividad) para que el LLM
+        pueda distinguir entre cursos completos y actividades específicas.
         """
         docs = self.retrieve(query)
         if not docs:
@@ -283,12 +291,25 @@ class RAGRetriever:
         context_parts = []
         sources = []
         for i, doc in enumerate(docs, 1):
-            context_parts.append(f"[Fuente {i}]\n{doc.page_content}")
+            meta = doc.metadata
+            doc_type = meta.get("doc_type", "")
+            course_name = meta.get("name", "")
+
+            # Encabezado de jerarquía según el tipo de documento
+            if doc_type == "course_summary" and course_name:
+                header = f"[Fuente {i}] CURSO: {course_name}"
+            elif doc_type == "knowledge":
+                header = f"[Fuente {i}] CONOCIMIENTO GENERAL"
+            else:
+                header = f"[Fuente {i}]"
+
+            context_parts.append(f"{header}\n{doc.page_content}")
             sources.append({
                 "index": i,
-                "source": doc.metadata.get("source", ""),
-                "doc_type": doc.metadata.get("doc_type", ""),
-                "collection": doc.metadata.get("collection", ""),
+                "source": meta.get("source", ""),
+                "doc_type": doc_type,
+                "collection": meta.get("collection", ""),
+                "name": course_name,
             })
 
         return "\n\n---\n\n".join(context_parts), sources

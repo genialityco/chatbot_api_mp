@@ -229,6 +229,11 @@ NO_CONTEXT_TEMPLATE = """{system_prompt}
 
 No se encontró información relevante en la base de datos para esta consulta.
 Responde indicando que no tienes datos disponibles sobre este tema, pero guía al usuario hacia lo que sí puede explorar.
+## IMPORTANTE
+No se encontró información relevante en la base de datos para esta consulta.
+- NO inventes cursos, eventos, actividades ni datos que no existan.
+- Si no tienes datos concretos, dilo claramente y ofrece ayudar con una pregunta más específica.
+- Responde solo con conocimiento general si la pregunta es conceptual (no sobre el catálogo).
 """
 
 
@@ -240,6 +245,7 @@ def build_prompt(
     org_id: str | None,
     history: list[dict],
     extra_instructions: str | None = None,
+    history_summary: str | None = None,
 ) -> list[dict]:
     """Construye lista de mensajes en formato dict {role, content}."""
     has_data = bool(data_context) and "No se encontraron" not in data_context
@@ -258,7 +264,11 @@ def build_prompt(
     else:
         system_content = NO_CONTEXT_TEMPLATE.format(system_prompt=system_prompt)
 
-    print(f"[build_prompt] using={'SYSTEM_TEMPLATE' if has_data else 'NO_CONTEXT_TEMPLATE'}")
+    # Inyectar resumen de conversación anterior si existe
+    if history_summary:
+        system_content += f"\n\n## CONTEXTO DE CONVERSACIÓN ANTERIOR\n{history_summary}"
+
+    print(f"[build_prompt] using={'SYSTEM_TEMPLATE' if has_data else 'NO_CONTEXT_TEMPLATE'} summary={'yes' if history_summary else 'no'}")
 
     messages: list[dict] = [{"role": "system", "content": system_content}]
     for msg in history:
@@ -294,21 +304,25 @@ async def _save_quiz_result(uri: str, database: str, platform_id: str, user_id: 
     """Guarda el resultado del quiz generado por el LLM en una colección dedicada."""
     from pymongo import MongoClient
     import datetime
-    
+
     try:
-        client = MongoClient(uri, serverSelectionTimeoutMS=5000)
+        client = MongoClient(
+            uri,
+            serverSelectionTimeoutMS=10000,
+            connectTimeoutMS=10000,
+            retryWrites=True,
+        )
         db = client[database]
-        
-        # Colección ej: quizzes_gencampus
+
         col_name = f"quizzes_{platform_id}"
-        
+
         doc = {
             "user_id": user_id,
             "org_id": org_id,
             "created_at": datetime.datetime.now(datetime.timezone.utc),
             "quiz_data": quiz_data.get("quiz_result", quiz_data)
         }
-        
+
         db[col_name].insert_one(doc)
         print(f"[quiz] Quiz result saved successfully in {col_name} for user {user_id}")
     except Exception as e:
@@ -340,6 +354,13 @@ class ChatService:
         session_id: str | None = None,
     ) -> dict[str, Any]:
         session_id = session_id or str(uuid.uuid4())
+
+        # Resolver org_id desde la DB si no viene en el request
+        if not org_id and self.db_connections:
+            from app.services.socratic_agent import _resolve_org_id
+            org_id = await asyncio.to_thread(_resolve_org_id, self.db_connections[0], user_id) or org_id
+            if org_id:
+                print(f"[chat] resolved org_id from db: {org_id}")
 
         user_id_field = "user_id" if self.db_connections and self._uses_snake_case() else "userId"
 
@@ -588,16 +609,21 @@ class ChatService:
         # Añadir las plantillas al data_context
         full_context = data_context + templates_context
 
+        # Comprimir historial largo: resumen de turnos antiguos + ventana reciente
+        from app.services.history_service import compress_history_for_prompt
+        history_summary, recent_history = await compress_history_for_prompt(history)
+
         messages = build_prompt(
             self.system_prompt,
             full_context,
             user_id,
             user_name,
             org_id,
-            history,
+            recent_history,
             extra_instructions=extra_instructions,
+            history_summary=history_summary or None,
         )
-        print(f"[chat] prompt_messages={len(messages)}, data_has_content={'No se encontraron' not in data_context}")
+        print(f"[chat] prompt_messages={len(messages)} history_turns={len(recent_history)//2} summary={'yes' if history_summary else 'no'}")
         messages.append({"role": "user", "content": message})
         
         # Aumentar la temperatura y añadir un ruido algorítmico si estamos en modo evaluación
@@ -1163,17 +1189,16 @@ async def _build_gencampus_cards_template_async(conn: dict, docs: list[dict], co
 def _run_query(conn: dict, collection: str, mongo_filter: dict, sort: list | None = None, limit: int | None = None) -> list[dict]:
     """Ejecuta el find en MongoDB con el filtro ya generado."""
     from app.db.mongo_query import _serialize, _REQUIRE_FILTER, MAX_DOCS, ReadOnlyCollection
-    from pymongo import MongoClient
+    from app.db.mongo_pool import get_db
 
     if not mongo_filter and collection in _REQUIRE_FILTER:
         print(f"[chat] skipping {collection} — requires filter")
         return []
 
-    client = MongoClient(conn["uri"], serverSelectionTimeoutMS=8000)
     try:
-        col = ReadOnlyCollection(client[conn["database"]][collection])
+        db = get_db(conn["uri"], conn["database"])
+        col = ReadOnlyCollection(db[collection])
         n = limit or MAX_DOCS
-        # Usar collation para búsquedas fuzzy si hay regex
         collation = {"locale": "es", "strength": 1} if _has_regex_in_filter(mongo_filter) else None
         cursor = col._col.find(mongo_filter, limit=n, collation=collation)
         if sort:
@@ -1184,8 +1209,6 @@ def _run_query(conn: dict, collection: str, mongo_filter: dict, sort: list | Non
     except Exception as e:
         print(f"[mongo_query] query error: {e}")
         return []
-    finally:
-        client.close()
 
 
 def _has_regex_in_filter(filter_dict: dict) -> bool:
@@ -1493,14 +1516,12 @@ async def _fetch_related_col_multi(
 ) -> list[dict]:
     """Busca múltiples documentos relacionados por lista de IDs."""
     from app.db.mongo_query import _serialize, MAX_DOCS
-    from pymongo import MongoClient
+    from app.db.mongo_pool import get_db
     from bson import ObjectId
 
     def _query():
-        client = MongoClient(conn["uri"], serverSelectionTimeoutMS=8000)
         try:
-            col = client[conn["database"]][collection]
-            # Intentar con ObjectId
+            col = get_db(conn["uri"], conn["database"])[collection]
             try:
                 oids = [ObjectId(i) for i in ids]
                 docs = list(col.find({"_id": {"$in": oids}}, limit=MAX_DOCS))
@@ -1508,11 +1529,9 @@ async def _fetch_related_col_multi(
                     return [_serialize(d) for d in docs]
             except Exception:
                 pass
-            # Intentar con string _id
             docs = list(col.find({"_id": {"$in": ids}}, limit=MAX_DOCS))
             if docs:
                 return [_serialize(d) for d in docs]
-            # Intentar con event_id como string (gencampus)
             if "event_id" in schema_fields:
                 docs = list(col.find({"event_id": {"$in": ids}}, limit=MAX_DOCS))
                 return [_serialize(d) for d in docs]
@@ -1520,8 +1539,6 @@ async def _fetch_related_col_multi(
         except Exception as e:
             print(f"[chat] _fetch_related_col_multi error {collection}: {e}")
             return []
-        finally:
-            client.close()
 
     return await asyncio.to_thread(_query)
 

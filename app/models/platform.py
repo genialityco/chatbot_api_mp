@@ -44,6 +44,7 @@ class Platform(Document):
     )
     rag_index_id: str | None = None          # ID del índice vectorial
     rag_indexed_at: datetime | None = None
+    socratic_mode: bool = True              # Activa el agente socrático (enseña con preguntas)
     active: bool = True
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
