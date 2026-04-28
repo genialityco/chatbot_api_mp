@@ -4,6 +4,7 @@ Extrae cursos, módulos, actividades y transcripciones, genera resúmenes
 por medio del LLM y los prepara como documentos para indexar en el RAG.
 """
 import asyncio
+import os
 from typing import Any
 from pymongo import MongoClient
 from langchain_core.documents import Document
@@ -41,13 +42,14 @@ async def build_content_rag(uri: str, database: str, platform_id: str, org_id: s
     """Extrae los datos reales, los resume e indexa en el RAG."""
     client = MongoClient(uri, serverSelectionTimeoutMS=8000)
     db = client[database]
-    
+
     events = list(db["events"].find({}))
     modules = list(db["modules"].find({}))
     activities = list(db["activities"].find({}))
     transcripts = list(db["transcript_segments"].find({}))
+    raw_documents = list(db["documents"].find({"active": True}))
 
-    print(f"[content_indexer] Encontrados: {len(events)} eventos, {len(modules)} modulos, {len(activities)} actividades, {len(transcripts)} fragmentos transcript.")
+    print(f"[content_indexer] Encontrados: {len(events)} eventos, {len(modules)} modulos, {len(activities)} actividades, {len(transcripts)} fragmentos transcript, {len(raw_documents)} documentos.")
 
     # Agrupar por curso
     courses_data = {}
@@ -99,9 +101,38 @@ async def build_content_rag(uri: str, database: str, platform_id: str, org_id: s
     client.close()
 
     documents = []
-    
+
     # Procesar cada curso para RAG
     from app.rag.pipeline import _prepare_documents
+
+    # Indexar documentos subidos (PDF, PPT, Word, etc.)
+    for raw_doc in raw_documents:
+        content = raw_doc.get("content", "").strip()
+        if not content:
+            continue
+
+        event_id = str(raw_doc["eventId"]) if raw_doc.get("eventId") else ""
+        org_id_doc = str(raw_doc["organizationId"]) if raw_doc.get("organizationId") else ""
+
+        # Determinar nivel de asociación para el título de contexto
+        if event_id:
+            scope = f"evento:{event_id}"
+        else:
+            scope = f"organización:{org_id_doc}"
+
+        documents.append(Document(
+            page_content=f"DOCUMENTO: {raw_doc.get('name', '')}\nASSOCIACIÓN: {scope}\n\n{content}",
+            metadata={
+                "doc_type": raw_doc.get("mimetype", "document"),
+                "title": raw_doc.get("name", ""),
+                "event_id": event_id,
+                "org_id": org_id_doc,
+                "source": raw_doc.get("url", ""),
+                "collection": "documents",
+            }
+        ))
+
+    print(f"[content_indexer] {len(raw_documents)} documentos cargados para indexar.")
     
     for eid, cdata in courses_data.items():
         course_name = cdata["name"]
@@ -136,27 +167,103 @@ async def build_content_rag(uri: str, database: str, platform_id: str, org_id: s
             except Exception as e:
                 print(f"[content_indexer] Error resumiendo {course_name}: {e}")
 
-    # Dividir y empaquetar los documentos grandes usando _prepare_documents para evitar el error de límite de embeddings
+    final_documents = []
     if documents:
-        # Convertiremos los Documents construidos arriba al formato que espera `_prepare_documents` 
-        # (lista de diccionarios con 'text' y metadata)
-        raw_docs_list = []
-        for doc in documents:
-            raw_docs_list.append({
-                "text": doc.page_content,
-                **doc.metadata
-            })
-            
+        raw_docs_list = [{"text": doc.page_content, **doc.metadata} for doc in documents]
         final_documents = _prepare_documents(raw_docs_list)
-        
         embeddings = get_embeddings()
         _build_vector_store(final_documents, embeddings, platform_id, org_id, force=True)
-        print(f"[content_indexer] Se han indexado {len(final_documents)} chunks de contenido en RAG.")
-    
+        print(f"[content_indexer] Se han indexado {len(final_documents)} chunks en RAG.")
+
     return {
         "status": "ready",
-        "documents_indexed": len(documents)
+        "courses_indexed": len(courses_data),
+        "documents_indexed": len(raw_documents),
+        "total_chunks": len(final_documents),
     }
+
+async def reindex_documents(
+    uri: str,
+    database: str,
+    platform_id: str,
+    org_id: str | None = None,
+) -> dict[str, Any]:
+    """
+    Re-indexa solo la colección 'documents' en el RAG existente.
+    No toca cursos ni llama al LLM — es rápido y apto para llamarse
+    cada vez que GenCampus sube un documento nuevo.
+    """
+    from app.rag.pipeline import (
+        _load_vector_store, _build_vector_store, get_embeddings,
+        _prepare_documents, _chroma_dir, _namespace,
+    )
+
+    client = MongoClient(uri, serverSelectionTimeoutMS=8000)
+    db = client[database]
+    raw_documents = list(db["documents"].find({"active": True}))
+    client.close()
+
+    print(f"[reindex_documents] {len(raw_documents)} documentos activos encontrados.")
+
+    lc_docs: list[Document] = []
+    for raw_doc in raw_documents:
+        content = raw_doc.get("content", "").strip()
+        if not content:
+            continue
+        event_id = str(raw_doc["eventId"]) if raw_doc.get("eventId") else ""
+        org_id_doc = str(raw_doc.get("organizationId", ""))
+        lc_docs.append(Document(
+            page_content=f"DOCUMENTO: {raw_doc.get('name', '')}\n\n{content}",
+            metadata={
+                "doc_type": "document",
+                "collection": "documents",
+                "title": raw_doc.get("name", ""),
+                "event_id": event_id,
+                "org_id": org_id_doc,
+                "source": raw_doc.get("url", ""),
+                "mongo_id": str(raw_doc["_id"]),
+            },
+        ))
+
+    embeddings = get_embeddings()
+    persist_dir = _chroma_dir(platform_id, org_id)
+
+    # Eliminar chunks anteriores de 'documents' del índice existente
+    if os.path.exists(persist_dir):
+        try:
+            import chromadb as _chromadb
+            chroma_client = _chromadb.PersistentClient(path=persist_dir)
+            col = chroma_client.get_collection(_namespace(platform_id, org_id))
+            existing = col.get(where={"collection": "documents"})
+            if existing["ids"]:
+                col.delete(ids=existing["ids"])
+                print(f"[reindex_documents] {len(existing['ids'])} chunks anteriores eliminados.")
+        except Exception as e:
+            print(f"[reindex_documents] No se pudo limpiar chunks anteriores: {e}")
+
+    if not lc_docs:
+        return {"status": "ok", "documents_indexed": 0, "chunks_indexed": 0}
+
+    raw_docs_list = [{"text": doc.page_content, **doc.metadata} for doc in lc_docs]
+    chunks = _prepare_documents(raw_docs_list)
+
+    vs = _load_vector_store(embeddings, platform_id, org_id)
+    if vs is not None:
+        vs.add_documents(chunks)
+    else:
+        _build_vector_store(chunks, embeddings, platform_id, org_id, force=False)
+
+    print(f"[reindex_documents] {len(chunks)} chunks indexados.")
+
+    from app.rag.pipeline import invalidate_retriever
+    invalidate_retriever(platform_id, org_id)
+
+    return {
+        "status": "ok",
+        "documents_indexed": len(lc_docs),
+        "chunks_indexed": len(chunks),
+    }
+
 
 if __name__ == "__main__":
     from app.core.config import get_settings

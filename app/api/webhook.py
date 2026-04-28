@@ -36,22 +36,22 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
         change = entry["changes"][0]["value"]
         messages = change.get("messages")
         if not messages:
-            # Son notificaciones de estado (leído, entregado) — ignorar
             return {"status": "ok"}
         msg = messages[0]
         sender = msg["from"]
         text = msg.get("text", {}).get("body", "")
         if not text:
             return {"status": "ok"}
+        # ID del número de WhatsApp Business que recibió el mensaje
+        phone_number_id = change.get("metadata", {}).get("phone_number_id")
     except (KeyError, IndexError):
-        # Payload inesperado — devolver 200 para que Meta no reintente
         return {"status": "ok"}
 
-    background_tasks.add_task(_process_and_reply, sender, text)
+    background_tasks.add_task(_process_and_reply, sender, text, phone_number_id)
     return {"status": "ok"}
 
 
-async def _process_and_reply(phone: str, message: str) -> None:
+async def _process_and_reply(phone: str, message: str, phone_number_id: str | None = None) -> None:
     """Llama al ChatService y envía la respuesta al usuario de WhatsApp."""
     from app.models.platform import Platform
     from app.services.chat_service import ChatService
@@ -62,9 +62,18 @@ async def _process_and_reply(phone: str, message: str) -> None:
             print(f"[webhook] platform '{_WA_PLATFORM_ID}' not found")
             return
 
+        # ─── Resolver organización por número de WhatsApp Business ────
+        org_id: str | None = None
+        if phone_number_id:
+            org = platform.get_org_by_whatsapp_phone(phone_number_id)
+            if org:
+                org_id = org.org_id
+                print(f"[webhook] org resuelto por phone_number_id={phone_number_id} → org_id={org_id}")
+            else:
+                print(f"[webhook] phone_number_id={phone_number_id} sin org asignada, usando contexto global")
+        # ──────────────────────────────────────────────────────────────
+
         # ─── Búsqueda de usuario por teléfono ─────────────────────────
-        # En Meta, el teléfono viene ej: "573104365063" (con código país, sin +)
-        # En la BD puede estar como: "573104365063", "+573104365063", "3104365063", o float(3104365063.0)
         possible_phones = [phone, f"+{phone}"]
         if len(phone) >= 10:
             last_10 = phone[-10:]
@@ -73,39 +82,50 @@ async def _process_and_reply(phone: str, message: str) -> None:
                 possible_phones.append(float(last_10))
             except ValueError:
                 pass
-                
-        user_id_str = phone  # Por defecto si no lo encontramos
+
+        user_id_str = phone
         user_name = None
-        
-        # Obtener conexión de DB
+
         gencampus_conn = next((c for c in platform.db_connections if c.database == settings.gencampus_mongo_db), None)
-        
+
         if gencampus_conn:
             client = AsyncIOMotorClient(gencampus_conn.uri)
             db = client[gencampus_conn.database]
-            
-            org_user = await db.organizationusers.find_one({
-                'properties.phone': {'$in': possible_phones}
-            })
-            
+
+            # Buscar usuario dentro de la org si ya la conocemos, o en toda la BD
+            query: dict = {'properties.phone': {'$in': possible_phones}}
+            if org_id:
+                query['organization_id'] = org_id
+
+            org_user = await db.organizationusers.find_one(query)
+
+            # Si no encontró con org_id, intentar sin filtro de org (fallback)
+            if not org_user and org_id:
+                org_user = await db.organizationusers.find_one({'properties.phone': {'$in': possible_phones}})
+
             if org_user and 'user_id' in org_user:
                 user_id_str = str(org_user['user_id'])
-                # Opcional: Buscar nombre del usuario si queremos usarlo luego
                 if 'properties' in org_user:
                     user_name = f"{org_user['properties'].get('names', '')} {org_user['properties'].get('lastNames', '')}".strip()
+                # Si org_id no se resolvió por phone_number_id, tomarlo del documento del usuario
+                if not org_id and org_user.get('organization_id'):
+                    org_id = str(org_user['organization_id'])
+                    print(f"[webhook] org_id resolved from organizationusers: {org_id}")
             else:
-                # No autorizado
                 await send_text_message(phone, "Lo siento, no estás autorizado para usar este canal ya que tu número no está registrado en la plataforma.")
                 client.close()
                 return
-                
+
             client.close()
         # ──────────────────────────────────────────────────────────────
 
+        session_id = f"wa_{phone}"
+        print(f"[webhook] chat → user_id={user_id_str} session_id={session_id} org_id={org_id}")
+
         service = ChatService(
             platform_id=_WA_PLATFORM_ID,
-            org_id=None,
-            system_prompt=platform.get_system_prompt(),
+            org_id=org_id,
+            system_prompt=platform.get_system_prompt(org_id),
             db_connections=[c.model_dump() for c in platform.db_connections],
         )
 
@@ -113,7 +133,8 @@ async def _process_and_reply(phone: str, message: str) -> None:
             message=message,
             user_id=user_id_str,
             user_name=user_name,
-            session_id=f"wa_{phone}",
+            org_id=org_id,
+            session_id=session_id,
         )
 
         answer = markdown_to_whatsapp(result["answer"])

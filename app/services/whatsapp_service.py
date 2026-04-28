@@ -11,6 +11,11 @@ _WA_API_URL = "https://graph.facebook.com/v18.0/{phone_id}/messages"
 
 def markdown_to_whatsapp(text: str) -> str:
     """Convierte formato Markdown básico al formato de WhatsApp."""
+    # Eliminar bloques HTML completos (tarjetas, divs, etc.)
+    text = re.sub(r'<!--.*?-->', '', text, flags=re.DOTALL)
+    text = re.sub(r'<[^>]+>', '', text)
+    # [texto](url) → texto: url  (WhatsApp no renderiza markdown links, pero sí URLs planas)
+    text = re.sub(r'\[([^\]]+)\]\((https?://[^\)]+)\)', r'\1: \2', text)
     # **negrita** → *negrita*
     text = re.sub(r"\*\*(.+?)\*\*", r"*\1*", text)
     # __negrita__ → *negrita*
@@ -20,6 +25,8 @@ def markdown_to_whatsapp(text: str) -> str:
     text = re.sub(r"^#{1,3}\s+(.+)$", r"*\1*", text, flags=re.MULTILINE)
     # Bloques de código → sin backticks
     text = re.sub(r"```[\s\S]*?```", lambda m: m.group(0).replace("```", ""), text)
+    # Limpiar líneas vacías excesivas
+    text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
 

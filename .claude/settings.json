@@ -1,7 +1,21 @@
 {
   "permissions": {
     "allow": [
-      "Bash(grep -E \"\\\\.py$|\\\\.yml$|\\\\.txt$|\\\\.md$|Dockerfile\")"
+      "Bash(grep -E \"\\\\.py$|\\\\.yml$|\\\\.txt$|\\\\.md$|Dockerfile\")",
+      "WebFetch(domain:openclaw.ai)",
+      "Bash(python -c \"from app.api import documents; print\\('OK', documents.router.routes\\)\")",
+      "Bash(d:/gen.iality/Proyectos/chatbot_api_mp/.venv/Scripts/python.exe -c ' *)",
+      "Bash(netstat -ano)",
+      "Bash(findstr :8000)",
+      "Bash(taskkill /PID 92856 /F)",
+      "Bash(taskkill /PID 62592 /F)",
+      "PowerShell(Stop-Process -Id 92856 -Force)",
+      "PowerShell(Stop-Process -Id 62592 -Force)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://127.0.0.1:8000/documents/reindex -X POST)",
+      "Bash(curl -s http://127.0.0.1:8000/openapi.json)",
+      "Bash(python -c \"import sys,json; spec=json.load\\(sys.stdin\\); [print\\(p\\) for p in spec['paths']]\")",
+      "PowerShell(Stop-Process -Id 62592, 80420, 92856 -Force -ErrorAction SilentlyContinue)",
+      "PowerShell(netstat -ano)"
     ]
   }
 }

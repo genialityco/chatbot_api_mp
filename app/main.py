@@ -13,6 +13,7 @@ from app.models.platform import Platform
 from app.models.conversation import ChatTurn
 from app.api import chat, platforms, recommendations, webhook
 from app.api import widget
+from app.api import documents
 
 settings = get_settings()
 
@@ -53,6 +54,7 @@ app.include_router(platforms.router)
 app.include_router(recommendations.router)
 app.include_router(widget.router)
 app.include_router(webhook.router)
+app.include_router(documents.router)
 
 
 @app.get("/health")

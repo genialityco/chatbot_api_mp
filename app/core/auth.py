@@ -66,6 +66,41 @@ async def get_platform_context(
     }
 
 
+async def get_platform_context_any_org(
+    x_platform_id: str = Header(..., alias="X-Platform-Id"),
+    x_api_key: str = Header(..., alias="X-API-Key"),
+    x_org_id: str | None = Header(None, alias="X-Org-Id"),
+) -> dict:
+    """
+    Como get_platform_context pero acepta cualquier org_id sin validarlo
+    contra el listado de organizaciones registradas. Útil para endpoints
+    donde el org_id solo se usa para namespacear (ej: reindex).
+    """
+    platform = await Platform.find_one(
+        Platform.platform_id == x_platform_id,
+        Platform.active == True,  # noqa: E712
+    )
+
+    if not platform:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Plataforma '{x_platform_id}' no encontrada o inactiva.",
+        )
+
+    if platform.api_key_hash != _hash_api_key(x_api_key):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="API Key inválida.",
+        )
+
+    return {
+        "platform": platform,
+        "org": None,
+        "platform_id": x_platform_id,
+        "org_id": x_org_id,
+    }
+
+
 # ─── Admin dependency (usa el SECRET_KEY del .env) ───────────────────────────
 
 async def require_admin(

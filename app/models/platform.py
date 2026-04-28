@@ -24,6 +24,7 @@ class RAGDocument(BaseModel):
 class Organization(BaseModel):
     org_id: str
     name: str
+    whatsapp_phone_number_id: str | None = None  # ID del número de WhatsApp Business asignado a esta org
     extra_docs: list[RAGDocument] = Field(default_factory=list)
     system_prompt_override: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -53,6 +54,9 @@ class Platform(Document):
     def get_org(self, org_id: str) -> Organization | None:
         return next((o for o in self.organizations if o.org_id == org_id), None)
 
+    def get_org_by_whatsapp_phone(self, phone_number_id: str) -> Organization | None:
+        return next((o for o in self.organizations if o.whatsapp_phone_number_id == phone_number_id), None)
+
     def get_system_prompt(self, org_id: str | None = None) -> str:
         if org_id:
             org = self.get_org(org_id)
@@ -80,12 +84,21 @@ class ChatRequest(BaseModel):
     session_id: str | None = None
 
 
+class SourcesUsed(BaseModel):
+    rag_chunks: int = 0
+    mongodb_collection: str | None = None
+    mongodb_docs: int = 0
+    history_turns: int = 0
+
+
 class ChatResponse(BaseModel):
     answer: str
     session_id: str
     sources: list[dict[str, Any]] = Field(default_factory=list)
     platform_id: str
     org_id: str | None = None
+    sources_used: SourcesUsed = Field(default_factory=SourcesUsed)
+    follow_up_questions: list[str] = Field(default_factory=list)
 
 
 class IndexStatusResponse(BaseModel):

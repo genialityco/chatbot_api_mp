@@ -19,7 +19,7 @@ from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
 
 from app.core.config import get_settings
-from app.rag.pipeline import RAGRetriever
+from app.rag.pipeline import get_retriever
 from app.db.mongo_query import fetch_collection_data, docs_to_context, generate_filter_async, search_transcript_segments
 from app.db.schema_introspector import load_schema_cache
 from app.services.history_service import load_history, save_history, persist_turn
@@ -193,8 +193,12 @@ SYSTEM_TEMPLATE = """{system_prompt}
 - Responde en el mismo idioma que el usuario.
 - NO digas que no tienes información si los datos están presentes arriba.
 - Nunca muestres IDs de MongoDB en la respuesta.
-- IMPORTANTE: Cuando haya tarjetas HTML disponibles, úsalas inyectando tu contenido en {{{{RESUMEN_AQUI}}}}. NO inventes URLs ni repitas enlaces sueltos en el texto.
+- IMPORTANTE: Cuando haya tarjetas HTML disponibles, úsalas inyectando tu contenido en {{{{RESUMEN_AQUI}}}}. NO inventes URLs que no estén en los datos.
 - Tu respuesta debe ser natural, aportando el contexto general y la respuesta a la pregunta del usuario.
+
+## Cómo citar fuentes
+- Cuando uses datos de la base de datos, menciona el nombre del curso, evento o actividad de forma natural en la respuesta (ej: "en el curso *Diplomado en Endocrinología* tienes un 0% de avance").
+- No generes ni repitas URLs en el cuerpo de la respuesta; los enlaces se adjuntan automáticamente al final.
 
 ## Instrucciones adicionales
 {extra_instructions}
@@ -203,6 +207,13 @@ SYSTEM_TEMPLATE = """{system_prompt}
 - Si el usuario escribe con faltas de ortografía, errores de tildes o términos médicos/educativos mal escritos, CORRÍGELOS AUTOMÁTICAMENTE en tu respuesta.
 - Ejemplos comunes: "cancer" → "cáncer", "mama" → "mamá", "informacion" → "información", "evaluacion" → "evaluación", "hipertension" → "hipertensión", "sintomas" → "síntomas".
 - Mantén la corrección natural y no menciones que estás corrigiendo errores.
+
+## Tutor Proactivo — Cierre de respuesta
+- Finaliza SIEMPRE con 1 o 2 sugerencias concretas y naturales basadas en los datos disponibles arriba.
+- Las sugerencias deben invitar al usuario a explorar el siguiente paso lógico: ver módulos, evaluar progreso, buscar un tema relacionado, hacer un quiz, etc.
+- Varía el estilo: a veces una pregunta directa, a veces una invitación. Nunca uses la misma frase de cierre dos veces.
+- Basa las sugerencias ÚNICAMENTE en los datos presentes; no inventes opciones inexistentes.
+- Ejemplos de cierres naturales: "¿Quieres que revise cuántos módulos le quedan?", "Si te interesa, puedo mostrarte las actividades de ese diplomado.", "También puedo buscarte cursos similares disponibles ahora."
 """
 
 NO_CONTEXT_TEMPLATE = """{system_prompt}
@@ -212,9 +223,12 @@ NO_CONTEXT_TEMPLATE = """{system_prompt}
 - Ejemplos comunes: "cancer" → "cáncer", "mama" → "mamá", "informacion" → "información", "evaluacion" → "evaluación", "hipertension" → "hipertensión", "sintomas" → "síntomas".
 - Mantén la corrección natural y no menciones que estás corrigiendo errores.
 
+## Tutor Proactivo — Cierre de respuesta
+- Aunque no encuentres datos específicos, orienta al usuario sugiriendo cómo puede explorar la plataforma o qué información puede pedirte.
+- Cierra con 1 pregunta o sugerencia concreta que lo invite a continuar la conversación.
 
 No se encontró información relevante en la base de datos para esta consulta.
-Responde indicando que no tienes datos disponibles sobre este tema.
+Responde indicando que no tienes datos disponibles sobre este tema, pero guía al usuario hacia lo que sí puede explorar.
 """
 
 
@@ -314,7 +328,7 @@ class ChatService:
         self.org_id = org_id
         self.system_prompt = system_prompt
         self.db_connections = db_connections or []
-        self.retriever = RAGRetriever(platform_id, org_id)
+        self.retriever = get_retriever(platform_id, org_id)
         self.llm = get_llm()
 
     async def chat(
@@ -598,7 +612,8 @@ class ChatService:
         print(f"[chat] answer_text={answer_text[:200] if answer_text else 'EMPTY'}")
 
         # ── Paso 5: guardar historial Redis + persistir en MongoDB ───────────
-        
+        history_turns_count = len(history)  # capturar antes de agregar el turno actual
+
         # Interceptar resultado de quiz si el LLM emitió el bloque JSON
         quiz_save_coro = None
         quiz_match = re.search(r"```json\s*(\{.*?\"quiz_result\".*?\})\s*```", answer_text, re.DOTALL)
@@ -621,11 +636,17 @@ class ChatService:
         # solo formateamos las fechas
         answer_text = _format_dates_in_text(answer_text)
 
+        # Adjuntar sección de fuentes si el LLM no la incluyó ya
+        if "Para profundizar" not in answer_text and "Fuente:" not in answer_text:
+            fuentes = _build_fuentes_section(docs, primary, sources, org_id)
+            if fuentes:
+                answer_text = answer_text.rstrip() + fuentes
+
         history.append({"role": "user", "content": message})
-        history.append({"role": "assistant", "content": answer_text})
+        history.append({"role": "assistant", "content": _strip_html_for_history(answer_text)})
         collection_used = sources[0].get("collection") if sources else None
         
-        # Esperar a que se completen las operaciones de guardado para evitar "Task was destroyed"
+        # Guardar historial + persistir + generar follow-ups en paralelo
         tasks_to_gather = [
             save_history(self.platform_id, user_id, session_id, history),
             persist_turn(
@@ -638,12 +659,16 @@ class ChatService:
                 org_id=org_id,
                 collection_used=collection_used,
                 sources=sources,
-            )
+            ),
+            _generate_follow_ups(message, answer_text, data_context, self.platform_id),
         ]
         if quiz_save_coro:
             tasks_to_gather.append(quiz_save_coro)
-            
-        await asyncio.gather(*tasks_to_gather)
+
+        gather_results = await asyncio.gather(*tasks_to_gather, return_exceptions=True)
+        follow_up_questions: list[str] = (
+            gather_results[2] if isinstance(gather_results[2], list) else []
+        )
 
         return {
             "answer": answer_text,
@@ -651,6 +676,13 @@ class ChatService:
             "sources": [sources[0]] if sources else [],
             "platform_id": self.platform_id,
             "org_id": self.org_id,
+            "sources_used": {
+                "rag_chunks": len(sources),
+                "mongodb_collection": primary,
+                "mongodb_docs": len(docs),
+                "history_turns": history_turns_count,
+            },
+            "follow_up_questions": follow_up_questions,
         }
 
     def _rag_retrieve(self, message: str) -> tuple[str, list[dict]]:
@@ -749,6 +781,120 @@ async def _requires_db_query(query: str) -> bool:
     except Exception as e:
         print(f"[intent] _requires_db_query failed: {e}")
         return True # Por seguridad, asumir que sí necesita DB si hay error
+
+
+async def _generate_follow_ups(
+    user_message: str,
+    answer: str,
+    data_context: str,
+    platform_id: str,
+    n: int = 3,
+) -> list[str]:
+    """
+    Genera preguntas de seguimiento contextuales reutilizando data_context ya recuperado.
+    Corre en paralelo con save_history, sin llamadas adicionales a DB.
+    """
+    from google import genai
+    from google.genai import types
+    import warnings
+
+    ctx_snippet = data_context[:2000] if len(data_context) > 2000 else data_context
+    answer_snippet = answer[:400] if len(answer) > 400 else answer
+
+    prompt = (
+        f"Eres un asistente experto de la plataforma '{platform_id}'.\n"
+        f"El usuario preguntó: \"{user_message}\"\n"
+        f"Respondiste: \"{answer_snippet}\"\n\n"
+        f"Contexto de datos disponibles:\n{ctx_snippet}\n\n"
+        f"Genera exactamente {n} preguntas de seguimiento cortas, naturales y en español "
+        f"que el usuario podría querer hacer a continuación, basadas ÚNICAMENTE en los datos "
+        f"de contexto de arriba. Sin numeración ni viñetas, una pregunta por línea."
+    )
+
+    _settings = get_settings()
+    client = genai.Client(api_key=_settings.gemini_api_key)
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
+            response = await client.aio.models.generate_content(
+                model=_settings.gemini_model,
+                contents=prompt,
+                config=types.GenerateContentConfig(temperature=0.3),
+            )
+        lines = [ln.strip() for ln in response.text.strip().split("\n") if ln.strip()]
+        return lines[:n]
+    except Exception as exc:
+        print(f"[follow_ups] error: {exc}")
+        return []
+
+
+_LINKABLE_COLLECTIONS = {"events", "activities", "courseattendees", "modules"}
+
+
+def _build_fuentes_section(
+    docs: list[dict],
+    primary: str | None,
+    rag_sources: list[dict],
+    org_id: str | None,
+) -> str:
+    """Construye '📚 Para profundizar:' con los recursos reales encontrados."""
+    base = settings.gencampus_base_url
+
+    lines: list[str] = []
+    seen: set[str] = set()
+
+    if docs and primary in _LINKABLE_COLLECTIONS:
+        for doc in docs[:5]:
+            name = (
+                doc.get("name") or doc.get("title") or
+                doc.get("eventName") or doc.get("name_event") or
+                doc.get("eventTitle") or doc.get("courseName") or
+                doc.get("course_name")
+            )
+
+            url: str | None = None
+            if org_id:
+                if primary == "events":
+                    eid = doc.get("_id")
+                    if eid:
+                        url = f"{base}/organization/{org_id}/course/{eid}"
+                elif primary == "activities":
+                    aid = doc.get("_id")
+                    if aid:
+                        url = f"{base}/organization/{org_id}/activitydetail/{aid}"
+                elif primary in ("courseattendees", "modules"):
+                    eid = doc.get("eventId") or doc.get("event_id")
+                    if eid:
+                        url = f"{base}/organization/{org_id}/course/{eid}"
+
+            if not name and not url:
+                continue
+
+            key = url or name
+            if key in seen:
+                continue
+            seen.add(key)
+
+            label = name or "Ver recurso"
+            lines.append(f"- [{label}]({url})" if url else f"- {label}")
+
+    if lines:
+        return "\n\n📚 *Para profundizar:*\n" + "\n".join(lines)
+
+    return ""
+
+
+def _strip_html_for_history(text: str) -> str:
+    """Quita tags HTML de la respuesta antes de guardar en historial.
+    El LLM no necesita re-leer HTML propio para mantener contexto conversacional;
+    el texto limpio es suficiente y evita que el historial crezca innecesariamente.
+    """
+    if not text:
+        return text
+    cleaned = re.sub(r'<!--.*?-->', '', text, flags=re.DOTALL)
+    cleaned = re.sub(r'<[^>]+>', '', cleaned)
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    return cleaned.strip()
 
 
 def _format_seconds(seconds: float) -> str:

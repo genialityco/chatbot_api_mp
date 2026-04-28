@@ -374,6 +374,10 @@ def docs_to_context(collection: str, docs: list[dict], org_id: str = "") -> str:
             url = f"{base}/organization/{org_id}/course/{doc['_id']}"
         elif collection == "activities" and doc.get("_id") and org_id:
             url = f"{base}/organization/{org_id}/activitydetail/{doc['_id']}"
+        elif collection == "courseattendees" and org_id:
+            event_id = doc.get("eventId") or doc.get("event_id")
+            if event_id:
+                url = f"{base}/organization/{org_id}/course/{event_id}"
 
         entry = {"name": doc.get("name", ""), **{k: v for k, v in doc.items() if k not in ("_id",)}}
         if url:

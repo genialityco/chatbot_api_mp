@@ -21,6 +21,25 @@ from app.db.schema_introspector import introspect_database, schema_to_text
 
 settings = get_settings()
 
+# ─── Caché de retrievers (por proceso, vive mientras el servidor esté corriendo) ─
+_retriever_cache: dict[tuple[str, str | None], "RAGRetriever"] = {}
+
+
+def get_retriever(platform_id: str, org_id: str | None = None) -> "RAGRetriever":
+    """Devuelve un RAGRetriever cacheado por (platform_id, org_id)."""
+    key = (platform_id, org_id)
+    if key not in _retriever_cache:
+        _retriever_cache[key] = RAGRetriever(platform_id, org_id)
+        print(f"[rag_cache] nuevo retriever creado para {key}")
+    return _retriever_cache[key]
+
+
+def invalidate_retriever(platform_id: str, org_id: str | None = None) -> None:
+    """Elimina el retriever del caché para forzar recarga tras un reindex."""
+    key = (platform_id, org_id)
+    if _retriever_cache.pop(key, None) is not None:
+        print(f"[rag_cache] retriever invalidado para {key}")
+
 
 # ─── Namespace helpers ───────────────────────────────────────────────────────
 

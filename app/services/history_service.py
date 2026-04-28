@@ -35,9 +35,14 @@ async def load_history(platform_id: str, user_id: str, session_id: str) -> list[
     try:
         raw = await r.get(_key(platform_id, user_id, session_id))
         if raw:
-            return json.loads(raw)
+            history = json.loads(raw)
+            print(f"[history] loaded {len(history)} msgs from Redis (session={session_id})")
+            return history
         # Fallback: cargar desde MongoDB si no está en Redis (sesión reanudada)
-        return await _load_session_from_mongo(platform_id, user_id, session_id)
+        print(f"[history] Redis miss for session={session_id}, falling back to MongoDB")
+        history = await _load_session_from_mongo(platform_id, session_id)
+        print(f"[history] loaded {len(history)} msgs from MongoDB (session={session_id})")
+        return history
     except Exception as e:
         print(f"[history] redis load error: {e}")
         return []
@@ -46,14 +51,16 @@ async def load_history(platform_id: str, user_id: str, session_id: str) -> list[
 
 
 async def _load_session_from_mongo(
-    platform_id: str, user_id: str, session_id: str
+    platform_id: str, session_id: str
 ) -> list[dict]:
-    """Reconstruye el historial de una sesión desde MongoDB (para reanudar)."""
+    """Reconstruye el historial de una sesión desde MongoDB (para reanudar).
+    Se busca solo por platform_id + session_id para tolerar cambios en user_id
+    entre sesiones (ej: WhatsApp donde user_id puede variar entre llamadas).
+    """
     from app.models.conversation import ChatTurn
     try:
         turns = await ChatTurn.find(
             ChatTurn.platform_id == platform_id,
-            ChatTurn.user_id == user_id,
             ChatTurn.session_id == session_id,
         ).sort(ChatTurn.created_at).to_list()
 
