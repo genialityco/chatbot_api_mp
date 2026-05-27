@@ -23,6 +23,9 @@ from app.rag.pipeline import get_retriever
 from app.db.mongo_query import fetch_collection_data, docs_to_context, generate_filter_async, search_transcript_segments
 from app.db.schema_introspector import load_schema_cache
 from app.services.history_service import load_history, save_history, persist_turn
+from app.services.faq_service import faq_service
+from app.services.unanswered_service import unanswered_service
+from app.services.intent_service import classify_intent, intent_needs_db, intent_is_personal, intent_needs_llm
 
 settings = get_settings()
 
@@ -362,49 +365,72 @@ class ChatService:
             if org_id:
                 print(f"[chat] resolved org_id from db: {org_id}")
 
-        user_id_field = "user_id" if self.db_connections and self._uses_snake_case() else "userId"
+        # ── Paso 0: clasificar intención ─────────────────────────────────────
+        intent = await classify_intent(message)
+        is_personal = intent_is_personal(intent)
+        needs_db = intent_needs_db(intent)
+        print(f"[chat] intent={intent} is_personal={is_personal} needs_db={needs_db}")
 
-        # Detectar si la pregunta es personal o una consulta general del catálogo
-        _personal_kw = [
-            "mis", "mi", "mío", "mía", "tengo", "he tomado", "he completado",
-            "mi progreso", "mis certificados", "mis inscripciones", "estoy inscrito",
-            "my", "i have", "i am enrolled",
-            "evaluame", "evalúame", "examen", "quiz", "prueba", "evaluado", "evaluarme", "preguntas"
-        ]
-        
-        pattern_personal = r'\b(?:' + '|'.join(_personal_kw) + r')\b'
-        is_personal = bool(re.search(pattern_personal, message.lower()))
+        # Fast-path: greeting/chitchat — responder sin pipeline completo
+        if not intent_needs_llm(intent):
+            history = await load_history(self.platform_id, user_id, session_id)
+            greeting_messages = [
+                {"role": "system", "content": self.system_prompt},
+                *[{"role": "user" if m.get("role") == "user" else "model", "content": m.get("content", "")} for m in history[-6:]],
+                {"role": "user", "content": message},
+            ]
+            answer_text = await _invoke_llm(greeting_messages)
+            asyncio.create_task(save_history(self.platform_id, user_id, session_id, history + [
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": answer_text},
+            ]))
+            return {
+                "answer": answer_text,
+                "session_id": session_id,
+                "sources": [],
+                "platform_id": self.platform_id,
+                "org_id": self.org_id,
+                "sources_used": {"rag_chunks": 0, "mongodb_collection": None, "mongodb_docs": 0, "history_turns": len(history)},
+                "follow_up_questions": [],
+            }
+
+        # Fast-path: FAQ confirmada
+        faq_answer = await faq_service.check_faq(message, self.platform_id, org_id)
+        if faq_answer:
+            print(f"[chat] FAQ hit — skipping pipeline")
+            return {
+                "answer": faq_answer,
+                "session_id": session_id,
+                "sources": [],
+                "platform_id": self.platform_id,
+                "org_id": self.org_id,
+                "sources_used": {"rag_chunks": 0, "mongodb_collection": None, "mongodb_docs": 0, "history_turns": 0},
+                "follow_up_questions": [],
+            }
+
+        user_id_field = "user_id" if self.db_connections and self._uses_snake_case() else "userId"
 
         if is_personal:
             ctx_parts = [f"{user_id_field}: {user_id}"]
             if user_name:
                 ctx_parts.append(f"nombre: {user_name}")
-            # NOTA: no incluir org_id en el enriquecimiento — se usa solo para URLs, no para filtros MongoDB
             enriched_message = f"{message} [{', '.join(ctx_parts)}]"
         else:
-            # Consulta general — sin contexto de usuario
             enriched_message = message
 
-        # ── Paso 1: RAG + historial + clasificación de intención en paralelo ──────────────────────────────
-        # Fast-track: si usa ciertas palabras clave muy específicas, forzar DB sin preguntar al LLM
+        # ── Paso 1: RAG + historial en paralelo ──────────────────────────────
+        # Fast-track por keywords específicos (fuerza DB incluso si intent es general_knowledge)
         force_db_kw = ["evaluame", "evalúame", "examen", "quiz", "prueba", "evaluado", "evaluarme", "preguntas", "progreso", "inscrito", "video", "videos"]
         pattern_force_db = r'\b(?:' + '|'.join(force_db_kw) + r')\b'
-        fast_track_db = bool(re.search(pattern_force_db, message.lower()))
-
-        if fast_track_db:
-            (rag_context, sources), history = await asyncio.gather(
-                asyncio.to_thread(self._rag_retrieve, message),
-                load_history(self.platform_id, user_id, session_id),
-            )
+        if bool(re.search(pattern_force_db, message.lower())):
             needs_db = True
-        else:
-            (rag_context, sources), history, needs_db = await asyncio.gather(
-                asyncio.to_thread(self._rag_retrieve, message),
-                load_history(self.platform_id, user_id, session_id),
-                _requires_db_query(message),
-            )
 
-        print(f"[chat] Intent classifier: needs_db={needs_db} (fast_track={fast_track_db})")
+        (rag_context, sources), history = await asyncio.gather(
+            asyncio.to_thread(self._rag_retrieve, message),
+            load_history(self.platform_id, user_id, session_id),
+        )
+
+        print(f"[chat] needs_db={needs_db} rag_chunks={len(sources)}")
 
         # ── Paso 2: generar filtro + cargar schema cache en paralelo ─────────
         data_parts: list[str] = []
@@ -695,6 +721,27 @@ class ChatService:
         follow_up_questions: list[str] = (
             gather_results[2] if isinstance(gather_results[2], list) else []
         )
+
+        # ── FAQ learning: registrar par pregunta/respuesta en background ──────
+        asyncio.create_task(
+            faq_service.register_qa(self.platform_id, org_id, message, answer_text)
+        )
+
+        # ── Unanswered learning: registrar si no hubo datos concretos ────────
+        _has_rag = bool(sources)
+        _has_db = bool(docs)
+        if not _has_rag and not _has_db:
+            asyncio.create_task(
+                unanswered_service.register(
+                    platform_id=self.platform_id,
+                    org_id=org_id,
+                    question=message,
+                    intent=intent,
+                    has_rag=_has_rag,
+                    has_db_data=_has_db,
+                    is_personal=is_personal,
+                )
+            )
 
         return {
             "answer": answer_text,
