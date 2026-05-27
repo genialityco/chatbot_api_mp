@@ -15,7 +15,11 @@
       "Bash(curl -s http://127.0.0.1:8000/openapi.json)",
       "Bash(python -c \"import sys,json; spec=json.load\\(sys.stdin\\); [print\\(p\\) for p in spec['paths']]\")",
       "PowerShell(Stop-Process -Id 62592, 80420, 92856 -Force -ErrorAction SilentlyContinue)",
-      "PowerShell(netstat -ano)"
+      "PowerShell(netstat -ano)",
+      "Bash(Get-ChildItem -Recurse -Directory app)",
+      "Bash(Select-Object -ExpandProperty FullName)",
+      "PowerShell(Tree \"d:\\\\gen.iality\\\\Proyectos\\\\chatbot_api_mp\\\\app\" -L 2)",
+      "PowerShell(Get-ChildItem -Path \"d:\\\\gen.iality\\\\Proyectos\\\\chatbot_api_mp\\\\app\" -Directory | ForEach-Object { Write-Output $_.Name })"
     ]
   }
 }

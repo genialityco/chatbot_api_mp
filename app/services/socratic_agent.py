@@ -18,6 +18,7 @@ from typing import Any
 from app.core.config import get_settings
 from app.rag.pipeline import RAGRetriever
 from app.services.history_service import load_history, save_history, persist_turn
+from app.services.faq_service import faq_service
 from app.db.mongo_query import fetch_collection_data, docs_to_context, generate_filter_async
 from app.db.schema_introspector import load_schema_cache
 
@@ -120,6 +121,7 @@ Para cada mensaje del estudiante debes:
 - EXCEPCIÓN: Si el usuario pregunta por sus datos personales (cursos, progreso, inscripciones), responde con esa información directamente usando los DATOS DE LA BASE DE DATOS, luego formula una pregunta socrática sobre el contenido de esos cursos.
 - NUNCA muestres IDs de MongoDB (cadenas hexadecimales de 24 caracteres) en la respuesta. Usa solo nombres, títulos o descripciones.
 - NUNCA muestres URLs con "undefined" o IDs en ellas. Si no tienes una URL válida, omítela.
+- NUNCA pidas al usuario su nombre, ID, correo u otros datos de identificación. Esa información ya está disponible en el sistema.
 - NUNCA inventes cursos, eventos o datos que no estén explícitamente en los DATOS DE LA BASE DE DATOS. Si no hay datos, dilo y pregunta socráticamente.
 
 ## Contexto del estudiante
@@ -448,6 +450,11 @@ NUNCA muestres IDs de MongoDB.
             tasks.append(quiz_save_coro)
 
         await asyncio.gather(*tasks)
+
+        # Registrar para auto-aprendizaje FAQ (ignora respuestas socráticas automáticamente)
+        asyncio.create_task(
+            faq_service.register_qa(self.platform_id, org_id, message, answer_text)
+        )
 
         return {
             "answer": answer_text,

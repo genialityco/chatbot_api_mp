@@ -11,6 +11,8 @@ from beanie import init_beanie
 from app.core.config import get_settings
 from app.models.platform import Platform
 from app.models.conversation import ChatTurn
+from app.models.faq import FAQItem
+from app.models.unanswered import UnansweredQuestion
 from app.api import chat, platforms, recommendations, webhook
 from app.api import widget
 from app.api import documents
@@ -24,7 +26,7 @@ async def lifespan(app: FastAPI):
     client = AsyncIOMotorClient(settings.meta_mongodb_uri)
     await init_beanie(
         database=client[settings.meta_mongodb_db],
-        document_models=[Platform, ChatTurn],
+        document_models=[Platform, ChatTurn, FAQItem, UnansweredQuestion],
     )
     app.state.mongo_client = client
     yield
