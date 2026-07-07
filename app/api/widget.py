@@ -23,6 +23,7 @@ async def chat_widget(
     user_id: str = "",
     user_name: str = "",
     org_id: str = "",
+    event_id: str = "",
 ):
     platform = await Platform.find_one(
         Platform.platform_id == platform_id,
@@ -41,6 +42,7 @@ async def chat_widget(
         user_id=user_id,
         user_name=user_name,
         org_id=org_id,
+        event_id=event_id,
         api_base_url=base_url,
     )
     return HTMLResponse(content=html)
@@ -53,6 +55,7 @@ def _build_widget_html(
     user_id: str,
     user_name: str,
     org_id: str,
+    event_id: str,
     api_base_url: str,
 ) -> str:
     greeting = f"Hola{' ' + user_name if user_name else ''}! ¿En qué puedo ayudarte?"
@@ -170,6 +173,7 @@ const API_KEY    = "{api_key}";
 const USER_ID    = "{user_id}";
 const USER_NAME  = "{user_name}";
 const ORG_ID     = "{org_id}";
+const EVENT_ID   = "{event_id}";
 
 marked.setOptions({{ breaks: true, gfm: true }});
 
@@ -306,6 +310,7 @@ form.addEventListener("submit", async (e) => {{
         user_id: USER_ID || "anonymous",
         user_name: USER_NAME || null,
         org_id: ORG_ID || null,
+        event_id: EVENT_ID || null,
         session_id: SESSION_ID,
       }}),
     }});

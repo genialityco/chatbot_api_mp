@@ -201,7 +201,8 @@ class SocraticAgent:
         self.org_id = org_id
         self.base_prompt = base_prompt
         self.db_connections = db_connections or []
-        self.retriever = RAGRetriever(platform_id, org_id)
+        from app.rag.pipeline import get_retriever
+        self.retriever = get_retriever(platform_id, org_id)
 
     async def chat(
         self,
@@ -214,13 +215,30 @@ class SocraticAgent:
         import uuid
         session_id = session_id or str(uuid.uuid4())
         resolved_org_id = org_id or self.org_id
+        
+        # En GenCampus, si nos pasan el event_id (como org_id) 
+        # queremos apuntar el RAG hacia la carpeta courses/event_id en lugar de la global.
+        rag_namespace = resolved_org_id
+        if self.platform_id == "gencampus":
+            if resolved_org_id and len(resolved_org_id) == 24 and not resolved_org_id.startswith("course_"):
+                rag_namespace = f"course_{resolved_org_id}"
+                
+        # Re-instanciar el retriever con el namespace correcto por si cambió
+        from app.rag.pipeline import get_retriever
+        self.retriever = get_retriever(self.platform_id, rag_namespace)
 
         # Si aún no tenemos org_id, resolverlo desde organizationusers del usuario
-        if not resolved_org_id and self.db_connections:
-            resolved_org_id = await asyncio.to_thread(
+        # Si rag_namespace es course_..., quitamos el prefijo para la base de datos
+        db_org_id = resolved_org_id
+        if db_org_id and db_org_id.startswith("course_"):
+            db_org_id = db_org_id.replace("course_", "")
+            
+        if not db_org_id and self.db_connections:
+            db_org_id = await asyncio.to_thread(
                 _resolve_org_id, self.db_connections[0], user_id
             )
-            print(f"[socratic] resolved org_id from db: {resolved_org_id}")
+            resolved_org_id = db_org_id
+            print(f"[socratic] resolved org_id from db: {db_org_id}")
 
         # ── 1. RAG + historial + clasificación de intención en paralelo ───────
         from app.services.chat_service import _requires_db_query, _search_transcripts_async, _build_gencampus_cards_template_async, _transcripts_to_context, _invoke_llm, _save_quiz_result
@@ -229,12 +247,18 @@ class SocraticAgent:
         is_video = bool(re.search(_PATTERN_VIDEO, message.lower()))
         is_eval_request = bool(re.search(_PATTERN_EVAL, message.lower()))
         is_detail_request = bool(re.search(_PATTERN_DETAIL, message.lower()))
+        
+        # En gencampus, si preguntan por el nombre del curso, queremos usar DB pero filtrando por ID
+        is_course_name_query = "nombre del curso" in message.lower() or "como se llama el curso" in message.lower()
 
         (rag_context, sources), history, needs_db = await asyncio.gather(
             asyncio.to_thread(self._rag_retrieve, message),
             load_history(self.platform_id, user_id, session_id),
             _requires_db_query(message),
         )
+        
+        if is_course_name_query:
+            needs_db = True
 
         # Si hay historial, revisar si el agente estaba refinando el tema del usuario.
         # En ese caso la respuesta del usuario ES el tema → forzar consulta específica a DB.
@@ -353,7 +377,14 @@ NUNCA muestres IDs de MongoDB.
             db_context = await self._fetch_user_data(message, user_id, resolved_org_id)
             print(f"[socratic] db_context_len={len(db_context)}")
         elif needs_db and conn and not is_personal:
-            last_assistant = next(
+            if is_course_name_query and db_org_id and len(db_org_id) == 24:
+                # Direct fetch for course by ID
+                from app.services.chat_service import _run_query
+                docs = await asyncio.to_thread(_run_query, conn, "events", {"_id": db_org_id}, None, 1)
+                if docs:
+                    db_context = docs_to_context("events", docs, resolved_org_id or "")
+            else:
+                last_assistant = next(
                 (m["content"] for m in reversed(history) if m.get("role") == "assistant"),
                 ""
             ) if history else ""

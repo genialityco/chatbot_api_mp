@@ -77,6 +77,16 @@ PLATFORMS = [
             }
         ],
     },
+    {
+    "platform_id": "networking",
+    "name": "Networking",
+    "system_prompt": (
+        "Eres un asistente experto en la plataforma Networking. "
+        "Responde siempre en el mismo idioma que el usuario. "
+        "Usa la información de contexto de Firestore para dar respuestas precisas."
+    ),
+    "db_connections": [],
+},
 ]
 
 

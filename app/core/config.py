@@ -80,6 +80,9 @@ class Settings(BaseSettings):
     genlive_mongo_uri: str = ""
     genlive_mongo_db: str = "live-events-v1"
 
+    # Networking Firestore
+    networking_firestore_credentials_path: str = ""  # Ruta a meetings-app.json
+
 
 @lru_cache
 def get_settings() -> Settings:

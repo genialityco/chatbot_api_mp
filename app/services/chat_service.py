@@ -249,6 +249,7 @@ def build_prompt(
     history: list[dict],
     extra_instructions: str | None = None,
     history_summary: str | None = None,
+    platform_id: str = "",
 ) -> list[dict]:
     """Construye lista de mensajes en formato dict {role, content}."""
     has_data = bool(data_context) and "No se encontraron" not in data_context
@@ -264,8 +265,19 @@ def build_prompt(
             base_url=settings.gencampus_base_url,
             extra_instructions=extra_instructions or "",
         )
+        if org_id: # Forzar conocimiento de org/evento incluso si hay datos
+            system_content += f"\n\nNOTA AL LLM: El usuario consulta sobre el evento/organización con ID: '{org_id}'. SIN EMBARGO, NUNCA debes decirle este ID al usuario."
+            if platform_id == "networking":
+                system_content += " Si te preguntan por el nombre del evento, la fecha, o su ubicación, EXTRAE esa información ÚNICAMENTE del bloque 'DATOS REALES DE LA BASE DE DATOS' de arriba. Ignora el nombre de la plataforma ('Networking') para responder cuál es el nombre del evento."
+            
+        # Omitir formalismos adicionales si la consulta es sencilla
+        system_content += "\n\nNOTA DE FORMATO: NO agregues secciones extrañas como 'Detalles del evento:' al final de tus respuestas a menos que sea estrictamente necesario. Trata de mantener tu respuesta conversacional."
+        
     else:
         system_content = NO_CONTEXT_TEMPLATE.format(system_prompt=system_prompt)
+        # Añadir contexto de organización/evento incluso si no hay datos
+        if org_id:
+            system_content += f"\n\nNOTA: El usuario está consultando sobre la organización o evento con ID: '{org_id}'."
 
     # Inyectar resumen de conversación anterior si existe
     if history_summary:
@@ -358,6 +370,20 @@ class ChatService:
     ) -> dict[str, Any]:
         session_id = session_id or str(uuid.uuid4())
 
+        # En GenCampus, si nos pasan el event_id (como org_id engañado desde la request web o en la variable) 
+        # queremos apuntar el RAG hacia la carpeta courses/event_id en lugar de la global.
+        rag_namespace = org_id
+        if self.platform_id == "gencampus":
+            event_id_to_check = message # Solo si estuviera en message (no)
+            # Como la API asigna event_id a org_id, revisamos si org_id parece un ID de evento
+            if org_id and len(org_id) == 24 and not org_id.startswith("course_"):
+                rag_namespace = f"course_{org_id}"
+            elif org_id and org_id.startswith("course_"):
+                rag_namespace = org_id
+                
+        # Re-instanciar el retriever con el namespace correcto por si cambió
+        self.retriever = get_retriever(self.platform_id, rag_namespace)
+
         # Resolver org_id desde la DB si no viene en el request
         if not org_id and self.db_connections:
             from app.services.socratic_agent import _resolve_org_id
@@ -421,6 +447,11 @@ class ChatService:
         # ── Paso 1: RAG + historial en paralelo ──────────────────────────────
         # Fast-track por keywords específicos (fuerza DB incluso si intent es general_knowledge)
         force_db_kw = ["evaluame", "evalúame", "examen", "quiz", "prueba", "evaluado", "evaluarme", "preguntas", "progreso", "inscrito", "video", "videos"]
+        
+        # En networking, forzamos RAG para datos generales del evento a menos que pregunten por estado en vivo
+        if self.platform_id == "networking":
+            force_db_kw = ["mis", "mi", "reunión", "reunion", "reuniones", "citas", "agenda", "mesa"]
+            
         pattern_force_db = r'\b(?:' + '|'.join(force_db_kw) + r')\b'
         if bool(re.search(pattern_force_db, message.lower())):
             needs_db = True
@@ -430,6 +461,10 @@ class ChatService:
             load_history(self.platform_id, user_id, session_id),
         )
 
+        # Si el RAG tiene la respuesta para preguntas generales de networking, no ir a la DB para ahorrar tiempo
+        if self.platform_id == "networking" and rag_context and not is_personal and not bool(re.search(pattern_force_db, message.lower())):
+            needs_db = False
+            
         print(f"[chat] needs_db={needs_db} rag_chunks={len(sources)}")
 
         # ── Paso 2: generar filtro + cargar schema cache en paralelo ─────────
@@ -595,6 +630,55 @@ class ChatService:
                 print(f"[chat] CRITICAL ERROR IN DB PHASE: {e}")
                 traceback.print_exc()
 
+        elif self.platform_id == "networking" and needs_db:
+            try:
+                from app.db.firestore_query import generate_firestore_filter_async, fetch_firestore_data, firestore_docs_to_context, get_related_firestore_context
+                
+                # 1. Determinar colección principal
+                msg_lower = message.lower()
+                if is_personal or any(kw in msg_lower for kw in ["reunión", "reunion", "cita", "encuentro", "reuniones", "citas", "mis", "mi"]):
+                    primary = "meetings"
+                elif any(kw in msg_lower for kw in ["agenda", "horario", "franja", "disponible", "mesa"]):
+                    primary = "agenda"
+                elif any(kw in msg_lower for kw in ["empresa", "empresas", "compañía", "compañia"]):
+                    primary = "companies"
+                elif any(kw in msg_lower for kw in ["producto", "productos", "software"]):
+                    primary = "products"
+                elif any(kw in msg_lower for kw in ["usuario", "asistente", "persona", "perfil"]):
+                    primary = "users"
+                else:
+                    primary = "events"
+                    
+                print(f"[chat networking] primary collection: {primary}")
+                
+                # 2. Generar filtros (o usar heurísticas en memoria si es personal)
+                filters = []
+                if not is_personal:
+                    filters = await generate_firestore_filter_async(message, primary)
+                    print(f"[chat networking] generated filters: {filters}")
+                    
+                # 3. Consultar Firestore
+                event_id_to_query = org_id # org_id en networking = event_id
+                if event_id_to_query:
+                    fs_docs = await fetch_firestore_data(event_id_to_query, primary, filters, user_id=user_id)
+                    print(f"[chat networking] fetched {len(fs_docs)} docs from firestore")
+                    
+                    if fs_docs:
+                        fs_context = firestore_docs_to_context(primary, fs_docs)
+                        data_parts.append(fs_context)
+                        
+                        # 4. Obtener nombres de usuarios y empresas relacionadas para reemplazar los IDs crudos
+                        related_context = await get_related_firestore_context(event_id_to_query, primary, fs_docs)
+                        if related_context:
+                            data_parts.append(related_context)
+                        
+                    docs = fs_docs # para los contadores de metadatos
+                    
+            except Exception as e:
+                import traceback
+                print(f"[chat networking] CRITICAL ERROR IN FIRESTORE PHASE: {e}")
+                traceback.print_exc()
+
         data_context = "\n\n".join(data_parts) if data_parts else "No se encontraron datos relevantes en la base de datos para esta consulta."
         print(f"[chat] data_context_len={len(data_context)}")
 
@@ -632,6 +716,9 @@ class ChatService:
                 "proporcionado arriba, reemplazando {{{{RESUMEN_AQUI}}}} con tu descripción o resumen."
             )
             
+        if self.platform_id == "networking":
+            extra_instructions += "\n- Cuando en los datos aparezcan IDs de usuarios o empresas (como requesterId o receiverId), CRUZA esa información con el bloque de 'INFORMACIÓN DE LOS USUARIOS' para responder con los nombres reales de las personas. NUNCA respondas mencionando IDs crudos."
+            
         # Añadir las plantillas al data_context
         full_context = data_context + templates_context
 
@@ -648,6 +735,7 @@ class ChatService:
             recent_history,
             extra_instructions=extra_instructions,
             history_summary=history_summary or None,
+            platform_id=self.platform_id,
         )
         print(f"[chat] prompt_messages={len(messages)} history_turns={len(recent_history)//2} summary={'yes' if history_summary else 'no'}")
         messages.append({"role": "user", "content": message})
@@ -689,10 +777,13 @@ class ChatService:
         answer_text = _format_dates_in_text(answer_text)
 
         # Adjuntar sección de fuentes si el LLM no la incluyó ya
-        if "Para profundizar" not in answer_text and "Fuente:" not in answer_text:
-            fuentes = _build_fuentes_section(docs, primary, sources, org_id)
-            if fuentes:
-                answer_text = answer_text.rstrip() + fuentes
+        # Solo para plataformas con esquema en MongoDB (como GenCampus/ACHO),
+        # para networking la estructura de links es distinta o no aplica
+        if self.platform_id != "networking":
+            if "Para profundizar" not in answer_text and "Fuente:" not in answer_text:
+                fuentes = _build_fuentes_section(docs, primary, sources, org_id)
+                if fuentes:
+                    answer_text = answer_text.rstrip() + fuentes
 
         history.append({"role": "user", "content": message})
         history.append({"role": "assistant", "content": _strip_html_for_history(answer_text)})

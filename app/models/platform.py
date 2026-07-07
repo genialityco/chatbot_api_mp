@@ -82,6 +82,7 @@ class ChatRequest(BaseModel):
     user_id: str                              # ID del usuario en la plataforma
     user_name: str | None = None              # Nombre del usuario (opcional)
     org_id: str | None = None                 # ID de organización (opcional)
+    event_id: str | None = None               # ID de evento (opcional, usado por networking)
     session_id: str | None = None
 
 

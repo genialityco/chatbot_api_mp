@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 
 from app.core.auth import require_admin
+from app.core.config import get_settings
 from app.models.platform import Platform, Organization, DBConnection, RAGDocument, IndexStatusResponse
 from app.rag.pipeline import RAGIndexer
 
@@ -276,12 +277,18 @@ async def trigger_content_index(
     - Sin event_id: re-indexa todos los cursos (force=True, borra y recrea).
     - Con event_id: indexa solo ese curso de forma incremental (no toca el resto).
     """
-    from app.rag.content_indexer import build_content_rag, build_single_course_rag
+    from app.rag.content_indexer import (
+        build_content_rag,
+        build_single_course_rag,
+        build_networking_rag,
+    )
 
+    settings = get_settings()
     platform = await Platform.find_one(Platform.platform_id == platform_id)
     if not platform:
         raise HTTPException(404, "Plataforma no encontrada.")
-    if not platform.db_connections:
+
+    if platform.platform_id != "networking" and not platform.db_connections:
         raise HTTPException(400, "La plataforma no tiene conexiones de base de datos configuradas.")
 
     key = _status_key(platform_id, org_id) + (f":{event_id}" if event_id else ":content")
@@ -292,11 +299,17 @@ async def trigger_content_index(
 
     async def _run():
         try:
-            conn = platform.db_connections[0]
-            if event_id:
-                result = await build_single_course_rag(conn.uri, conn.database, platform_id, event_id, org_id)
+            if platform.platform_id == "networking":
+                if event_id:
+                    result = await build_networking_rag(platform_id, event_id=event_id)
+                else:
+                    result = await build_networking_rag(platform_id)
             else:
-                result = await build_content_rag(conn.uri, conn.database, platform_id, org_id)
+                conn = platform.db_connections[0]
+                if event_id:
+                    result = await build_single_course_rag(conn.uri, conn.database, platform_id, event_id, org_id)
+                else:
+                    result = await build_content_rag(conn.uri, conn.database, platform_id, org_id)
             _index_status[key] = {**result, "status": "ready"}
         except Exception as e:
             _index_status[key] = {"status": "error", "message": str(e)}

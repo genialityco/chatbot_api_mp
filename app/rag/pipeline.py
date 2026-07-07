@@ -49,8 +49,16 @@ def _namespace(platform_id: str, org_id: str | None = None) -> str:
 
 
 def _chroma_dir(platform_id: str, org_id: str | None = None) -> str:
-    ns = _namespace(platform_id, org_id)
-    return os.path.join(settings.chroma_persist_dir, ns)
+    safe_org = org_id or "global"
+    # Reemplazar caracteres problemáticos por si acaso
+    safe_org = safe_org.replace(":", "_").replace("/", "_").replace("\\", "_")
+    
+    # Si viene con prefijo course_, estructurar bonito
+    if safe_org.startswith("course_"):
+        course_id = safe_org.replace("course_", "")
+        return os.path.join(settings.chroma_persist_dir, platform_id, "courses", course_id)
+        
+    return os.path.join(settings.chroma_persist_dir, platform_id, safe_org)
 
 
 # ─── Embeddings factory ──────────────────────────────────────────────────────
@@ -118,12 +126,11 @@ def _build_vector_store(
         collection_name = _namespace(platform_id, org_id)
 
         if force and os.path.exists(persist_dir):
-            import chromadb
-            client = chromadb.PersistentClient(path=persist_dir)
-            try:
-                client.delete_collection(collection_name)
-            except Exception:
-                pass
+            import shutil
+            # Eliminamos toda la carpeta del evento para reemplazar desde cero sin acumular archivos de Chroma
+            shutil.rmtree(persist_dir, ignore_errors=True)
+            
+        os.makedirs(persist_dir, exist_ok=True)
 
         # Si ya existe la colección y no es force, agregar incrementalmente
         existing = _load_vector_store(embeddings, platform_id, org_id)
@@ -142,7 +149,18 @@ def _build_vector_store(
 
     # FAISS — no soporta incremental nativo, siempre reconstruye
     vs = FAISS.from_documents(documents=documents, embedding=embeddings)
-    faiss_dir = os.path.join("./data/faiss", _namespace(platform_id, org_id))
+    safe_org = (org_id or "global").replace(":", "_").replace("/", "_").replace("\\", "_")
+    
+    if safe_org.startswith("course_"):
+        course_id = safe_org.replace("course_", "")
+        faiss_dir = os.path.join("./data/faiss", platform_id, "courses", course_id)
+    else:
+        faiss_dir = os.path.join("./data/faiss", platform_id, safe_org)
+    
+    if force and os.path.exists(faiss_dir):
+        import shutil
+        shutil.rmtree(faiss_dir, ignore_errors=True)
+        
     os.makedirs(faiss_dir, exist_ok=True)
     vs.save_local(faiss_dir)
     return vs
@@ -163,7 +181,14 @@ def _load_vector_store(
             collection_name=_namespace(platform_id, org_id),
         )
 
-    faiss_dir = os.path.join("./data/faiss", _namespace(platform_id, org_id))
+    safe_org = (org_id or "global").replace(":", "_").replace("/", "_").replace("\\", "_")
+    
+    if safe_org.startswith("course_"):
+        course_id = safe_org.replace("course_", "")
+        faiss_dir = os.path.join("./data/faiss", platform_id, "courses", course_id)
+    else:
+        faiss_dir = os.path.join("./data/faiss", platform_id, safe_org)
+        
     if not os.path.exists(faiss_dir):
         return None
     return FAISS.load_local(faiss_dir, embeddings, allow_dangerous_deserialization=True)
@@ -258,9 +283,16 @@ class RAGRetriever:
     def _get_store(self) -> Chroma | FAISS:
         if self._vs is None:
             self._vs = _load_vector_store(self.embeddings, self.platform_id, self.org_id)
+            if self._vs is not None:
+                print(f"[RAGRetriever] Cargado índice local para org_id={self.org_id}")
+                
             # Fallback a índice global de la plataforma si no hay por org
             if self._vs is None and self.org_id:
+                print(f"[RAGRetriever] Índice local {self.org_id} no existe, intentando fallback global...")
                 self._vs = _load_vector_store(self.embeddings, self.platform_id, None)
+                if self._vs is not None:
+                    print(f"[RAGRetriever] Cargado índice global (fallback) para platform={self.platform_id}")
+                    
             if self._vs is None:
                 raise ValueError(
                     f"No existe índice RAG para platform={self.platform_id} org={self.org_id}. "

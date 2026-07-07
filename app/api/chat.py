@@ -27,9 +27,21 @@ async def chat(
     """
     platform = ctx["platform"]
     org_id = request.org_id or ctx["org_id"]
+    
+    # In networking AND gencampus, if event_id is passed, we use it as the main routing context
+    if request.event_id:
+        # We append 'course_' for GenCampus explicitly here so Socratic and ChatService pick it up correctly
+        if platform.platform_id == "gencampus":
+            org_id = f"course_{request.event_id}"
+        elif platform.platform_id == "networking":
+            org_id = request.event_id
 
     # ── FAQ pre-check: responder sin LLM si hay una FAQ confirmada ────────────
-    faq_answer = await faq_service.check_faq(request.message, ctx["platform_id"], org_id)
+    faq_answer = None
+    # Temporalmente deshabilitar FAQ cache para networking para evitar respuestas erróneas cacheadas de tests anteriores
+    if platform.platform_id != "networking":
+        faq_answer = await faq_service.check_faq(request.message, ctx["platform_id"], org_id)
+        
     if faq_answer:
         session_id = request.session_id or str(uuid.uuid4())
         return ChatResponse(
@@ -64,7 +76,7 @@ async def chat(
             message=request.message,
             user_id=request.user_id,
             user_name=request.user_name,
-            org_id=request.org_id,
+            org_id=org_id,  # Usa el org_id resuelto (puede ser el event_id)
             session_id=request.session_id,
         )
     except Exception as exc:
