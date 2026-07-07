@@ -1,4 +1,5 @@
 import uuid
+import uuid
 from fastapi import APIRouter, Depends, HTTPException
 from app.core.auth import get_platform_context
 from app.models.platform import ChatRequest, ChatResponse
@@ -7,6 +8,7 @@ from app.services.chat_service import ChatService
 from app.services.socratic_agent import SocraticAgent
 from app.services.history_service import clear_history, get_user_history, get_platform_history
 from app.services.recommendation_service import RecommendationService
+from app.services.faq_service import faq_service
 from app.services.faq_service import faq_service
 
 router = APIRouter(prefix="/chat", tags=["Chat"])

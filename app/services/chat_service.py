@@ -26,6 +26,9 @@ from app.services.history_service import load_history, save_history, persist_tur
 from app.services.faq_service import faq_service
 from app.services.unanswered_service import unanswered_service
 from app.services.intent_service import classify_intent, intent_needs_db, intent_is_personal, intent_needs_llm
+from app.services.faq_service import faq_service
+from app.services.unanswered_service import unanswered_service
+from app.services.intent_service import classify_intent, intent_needs_db, intent_is_personal, intent_needs_llm
 
 settings = get_settings()
 
@@ -453,6 +456,8 @@ class ChatService:
             force_db_kw = ["mis", "mi", "reunión", "reunion", "reuniones", "citas", "agenda", "mesa"]
             
         pattern_force_db = r'\b(?:' + '|'.join(force_db_kw) + r')\b'
+        if bool(re.search(pattern_force_db, message.lower())):
+            needs_db = True
         if bool(re.search(pattern_force_db, message.lower())):
             needs_db = True
 
